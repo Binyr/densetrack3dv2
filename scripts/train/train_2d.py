@@ -43,7 +43,7 @@ from tqdm import tqdm
 
 # from densetrack3d.utils.signal_utils import sig_handler, term_handler
 
-TAPVID2D_DIR, KUBRIC3D_MIX_DIR = None, None
+TAPVID2D_DIR, KUBRIC3D_MIX_DIR = None, "datasets/kubric_DELTA/movif/kubric_processed_mix_3d/"
 
 
 def sample_sparse_queries(trajs_g, vis_g):
@@ -151,8 +151,9 @@ def forward_batch(batch, model, args):
         traj_gt_ = trajs_g[:, ind : ind + S].clone()
         vis_gt_ = vis_g[:, ind : ind + S].clone()
         valid_gt_ = valids[:, ind : ind + S].clone() * valid_mask[:, ind : ind + S, :n_sparse_queries].clone()
-
-        coord_predictions_ = coord_predictions[idx][:, :, :, :n_sparse_queries, :]
+        
+        # coord_predictions_ = coord_predictions[idx][:, :, :, :n_sparse_queries, :]
+        coord_predictions_ = torch.stack([x[:, :, :n_sparse_queries, :] for x in coord_predictions[idx]], dim=1) # B,I,S,N,C
         vis_predictions_ = vis_predictions[idx][:, :, :n_sparse_queries]
         conf_predictions_ = conf_predictions[idx][:, :, :n_sparse_queries]
 
@@ -167,7 +168,7 @@ def forward_batch(batch, model, args):
         
         seq_loss += track_loss(coord_predictions_, traj_gt_, valid_gt_)
         vis_loss += balanced_bce_loss(vis_predictions_, vis_gt_, valid_gt_)
-        conf_loss += confidence_loss(coord_predictions_, conf_predictions_, traj_gt_, vis_gt_,valid_gt_, expected_dist_thresh=12.0/(W-1))
+        conf_loss += confidence_loss(coord_predictions_[:, -1], conf_predictions_, traj_gt_, vis_gt_,valid_gt_, expected_dist_thresh=12.0/(W-1))
 
     
 
@@ -185,7 +186,8 @@ def forward_batch(batch, model, args):
         if idx >= len(dense_coord_predictions):
             break
         
-        dense_coord_prediction_ = dense_coord_predictions[idx][0]
+        dense_coord_prediction_ = torch.stack([x for x in dense_coord_predictions[idx]], dim=1) # 1, I, 16, 2, 60, 80
+        dense_coord_prediction_ = dense_coord_prediction_[0]
         dense_vis_prediction_ = dense_vis_predictions[idx][0] # T,  H, W
         dense_conf_prediction_ = dense_conf_predictions[idx][0] # T,  H, W
 
@@ -208,10 +210,10 @@ def forward_batch(batch, model, args):
 
         dense_coord_prediction_[:, :, 0] /= (W-1)
         dense_coord_prediction_[:, :, 1] /= (H-1)
-
-        dense_seq_loss += track_loss(dense_coord_prediction_, gt_coord_)
+        
+        dense_seq_loss += track_loss(dense_coord_prediction_, gt_coord_, has_batch_dim=False)
         dense_vis_loss += bce_loss(dense_vis_prediction_, gt_alpha)
-        dense_conf_loss += confidence_loss(dense_coord_prediction_, dense_conf_prediction_, gt_coord_, gt_alpha, expected_dist_thresh=12.0/(W-1), has_batch_dim=False)
+        dense_conf_loss += confidence_loss(dense_coord_prediction_, dense_conf_prediction_, gt_coord_, gt_alpha, expected_dist_thresh=12.0/(W-1), has_batch_dim=False, is_dense=True)
 
     dense_seq_loss = dense_seq_loss * args.lambda_2d / len(dense_coord_predictions) # FIXME
     dense_vis_loss = dense_vis_loss * args.lambda_vis / len(dense_coord_predictions)
@@ -377,23 +379,24 @@ class Lite(LightningLite):
         if self.global_rank == 0:
             eval_dataloaders = []
             
-            eval_davis_dataset = TapVid2DDataset(
-                data_root=TAPVID2D_DIR,
-                dataset_type="davis",
-                resize_to_256=True,
-                queried_first=True,
-                read_from_s3=False,
-            )
+            if False:
+                eval_davis_dataset = TapVid2DDataset(
+                    data_root=TAPVID2D_DIR,
+                    dataset_type="davis",
+                    resize_to_256=True,
+                    queried_first=True,
+                    read_from_s3=False,
+                )
 
-            eval_davis_dataloader = torch.utils.data.DataLoader(
-                eval_davis_dataset,
-                batch_size=1,
-                shuffle=False,
-                num_workers=1,
-                collate_fn=collate_fn,
-            )
+                eval_davis_dataloader = torch.utils.data.DataLoader(
+                    eval_davis_dataset,
+                    batch_size=1,
+                    shuffle=False,
+                    num_workers=1,
+                    collate_fn=collate_fn,
+                )
 
-            eval_dataloaders.append(("tapvid_davis_first", eval_davis_dataloader))
+                eval_dataloaders.append(("tapvid_davis_first", eval_davis_dataloader))
 
             save_video_dir = os.path.join(args.ckpt_path, "videos")
             os.makedirs(save_video_dir, exist_ok=True)
@@ -406,7 +409,7 @@ class Lite(LightningLite):
                 show_first_frame=0,
                 tracks_leave_trace=0,
             )
-
+        args.remove_space_attn = False
         model = DenseTrack2D(
             stride=args.model_stride,
             window_len=args.sliding_window_len,
@@ -540,7 +543,9 @@ class Lite(LightningLite):
 
         while should_keep_training:
             epoch += 1
-            for i_batch, batch in enumerate(tqdm(train_loader)):
+            progress_bar = tqdm(train_loader, desc="Training progress")
+            for i_batch, batch in enumerate(progress_bar):
+                iter_start = time.time()
                 batch, gotit = batch
                 if not all(gotit):
                     print("batch is None")
@@ -627,9 +632,9 @@ class Lite(LightningLite):
                             logging.info(f"Saving file {save_path}")
                             self.save(save_dict, save_path)
 
-                        if (epoch + 1) % args.evaluate_every_n_epoch == 0 or (
+                        if False and ((epoch + 1) % args.evaluate_every_n_epoch == 0 or (
                             args.validate_at_start and epoch == 0
-                        ):
+                        )):
                             run_test_eval(
                                 evaluator,
                                 model,
@@ -641,9 +646,16 @@ class Lite(LightningLite):
                             torch.cuda.empty_cache()
 
                 self.barrier()
+                iter_end = time.time()
+                elapsed_time = iter_end - iter_start
+                remaining_time = ((args.num_steps - total_steps) * elapsed_time) / 3600.0
+                progress_bar.set_postfix({"Loss": f"{loss.item():.4f}", "Remain": f"{remaining_time:.2f}h"})
+                progress_bar.update()
                 if total_steps > args.num_steps:
                     should_keep_training = False
                     break
+
+            progress_bar.close()
         if self.global_rank == 0:
             print("FINISHED TRAINING")
 
@@ -662,7 +674,7 @@ if __name__ == "__main__":
         "--batch_size", type=int, default=4, help="batch size used during training."
     )
     parser.add_argument("--num_nodes", type=int, default=1)
-    parser.add_argument("--num_workers", type=int, default=10, help="number of dataloader workers")
+    parser.add_argument("--num_workers", type=int, default=16, help="number of dataloader workers")
 
     parser.add_argument("--mixed_precision", action="store_true", help="use mixed precision")
     parser.add_argument("--lr", type=float, default=0.0005, help="max learning rate.")

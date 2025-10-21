@@ -29,7 +29,8 @@ class EfficientUpdateFormerV2(nn.Module):
         use_local_attn=True,
         linear_layer_for_vis_conf=False,
         linear_layer_for_feat=False,
-        feat_dim=-1
+        feat_dim=-1,
+        num_traj_groups=None,
     ):
         super().__init__()
 
@@ -41,6 +42,7 @@ class EfficientUpdateFormerV2(nn.Module):
         self.use_local_attn = use_local_attn
         self.linear_layer_for_vis_conf = linear_layer_for_vis_conf
         self.linear_layer_for_feat = linear_layer_for_feat
+        self.num_traj_groups = num_traj_groups
 
         self.input_transform = nn.Linear(input_dim, hidden_size, bias=True)
         # self.flow_head = nn.Linear(hidden_size, output_dim, bias=True)
@@ -210,7 +212,10 @@ class EfficientUpdateFormerV2(nn.Module):
         real_tokens = self.input_transform(input_tensor)
         virtual_tokens = repeat(self.virual_tracks, "1 n 1 c -> b n t c", b=B, t=T)
         virtual_tokens = rearrange(virtual_tokens, "b n t c -> b t n c")
-
+        if self.num_traj_groups is not None:
+            virtual_tokens = repeat(virtual_tokens.unsqueeze(2), "b t 1 n c -> b t k n c", k=self.num_traj_groups)
+            virtual_tokens = rearrange(virtual_tokens, "b t k n c -> b t (k n) c")
+            self.num_virtual_tracks = self.num_traj_groups * self.num_virtual_tracks
         # self.virual_tracks.repeat(B, 1, T, 1)
         tokens = torch.cat([real_tokens, virtual_tokens], dim=2)
         N_total = tokens.shape[2]
@@ -232,21 +237,44 @@ class EfficientUpdateFormerV2(nn.Module):
             dense_tokens = real_tokens[:, n_sparse:]
 
             # NOTE global attention
+            if self.num_traj_groups is None:
+                if use_efficient_global_attn:
+                    sparse_mask = attn_mask[:, :n_sparse]
+                    virtual_tokens = self.space_virtual2point_blocks[lvl](virtual_tokens, sparse_tokens, mask=sparse_mask)
+                else:
+                    virtual_tokens = self.space_virtual2point_blocks[lvl](virtual_tokens, real_tokens, mask=attn_mask)
 
-            if use_efficient_global_attn:
-                sparse_mask = attn_mask[:, :n_sparse]
-                virtual_tokens = self.space_virtual2point_blocks[lvl](virtual_tokens, sparse_tokens, mask=sparse_mask)
+                virtual_tokens = self.space_virtual_blocks[lvl](virtual_tokens)
+
+                # NOTE local attention
+                if self.use_local_attn and use_local_attn and dH > 0 and dW > 0:
+                    dense_tokens = self.local_attention(dense_tokens, dH, dW, lvl, B, T)
+                    real_tokens = torch.cat([sparse_tokens, dense_tokens], dim=1)
+
+                real_tokens = self.space_point2virtual_blocks[lvl](real_tokens, virtual_tokens, mask=attn_mask)
             else:
-                virtual_tokens = self.space_virtual2point_blocks[lvl](virtual_tokens, real_tokens, mask=attn_mask)
+                N_real = N_total - self.num_virtual_tracks
+                # 1. perm & reshape
+                perm = torch.randperm(N_real)
+                real_tokens_perm = real_tokens[:, perm]
+                real_tokens_perm = rearrange(real_tokens_perm, "b (k j) c -> (b k) j c", k=self.num_traj_groups)
+                attn_mask_perm = rearrange(attn_mask, "b (k j) -> (b k) j", k=self.num_traj_groups)
+                virtual_tokens_perm = rearrange(virtual_tokens, "b (k j) c -> (b k) j c", k=self.num_traj_groups)
 
-            virtual_tokens = self.space_virtual_blocks[lvl](virtual_tokens)
+                # 2. forward
+                virtual_tokens_perm = self.space_virtual2point_blocks[lvl](virtual_tokens_perm, real_tokens_perm, mask=attn_mask_perm)
 
-            # NOTE local attention
-            if self.use_local_attn and use_local_attn and dH > 0 and dW > 0:
-                dense_tokens = self.local_attention(dense_tokens, dH, dW, lvl, B, T)
-                real_tokens = torch.cat([sparse_tokens, dense_tokens], dim=1)
+                virtual_tokens_perm = self.space_virtual_blocks[lvl](virtual_tokens_perm)
 
-            real_tokens = self.space_point2virtual_blocks[lvl](real_tokens, virtual_tokens, mask=attn_mask)
+                real_tokens_perm = self.space_point2virtual_blocks[lvl](real_tokens_perm, virtual_tokens_perm, mask=attn_mask_perm)
+
+                # 3. perm & reshape back
+                # 3.1 reshape
+                attn_mask = rearrange(attn_mask_perm, "(b k) j -> b (k j)", k=self.num_traj_groups)
+                virtual_tokens = rearrange(virtual_tokens_perm, "(b k) j c -> b (k j) c", k=self.num_traj_groups)
+                real_tokens = rearrange(real_tokens_perm, "(b k) j c -> b (k j) c", k=self.num_traj_groups)
+                inv_perm = torch.argsort(perm)
+                real_tokens = real_tokens[:, inv_perm]
 
             tokens = torch.cat([real_tokens, virtual_tokens], dim=1)
 
@@ -291,6 +319,7 @@ class EfficientUpdateFormer(nn.Module):
         num_virtual_tracks=64,
         flash=False,
         use_local_attn=True,
+        num_traj_groups=None,
     ):
         super().__init__()
 
@@ -300,6 +329,7 @@ class EfficientUpdateFormer(nn.Module):
         self.hidden_size = hidden_size
         self.add_space_attn = add_space_attn
         self.use_local_attn = use_local_attn
+        self.num_traj_groups = num_traj_groups
 
         self.input_transform = nn.Linear(input_dim, hidden_size, bias=True)
         self.flow_head = nn.Linear(hidden_size, output_dim, bias=True)
@@ -334,6 +364,19 @@ class EfficientUpdateFormer(nn.Module):
                     for _ in range(num_blocks)
                 ]
             )
+            if self.num_traj_groups is not None:
+                self.space_virtual_blocks_local = nn.ModuleList(
+                    [
+                        AttnBlock(
+                            hidden_size,
+                            num_heads,
+                            mlp_ratio=mlp_ratio,
+                            attn_class=Attention,
+                            flash=flash,
+                        )
+                        for _ in range(num_blocks)
+                    ]
+                )
             self.space_point2virtual_blocks = nn.ModuleList(
                 [
                     CrossAttnBlock(hidden_size, hidden_size, num_heads, mlp_ratio=mlp_ratio, flash=flash)
@@ -346,7 +389,7 @@ class EfficientUpdateFormer(nn.Module):
                     for _ in range(num_blocks)
                 ]
             )
-            
+
             if self.use_local_attn:
                 self.space_local_blocks = nn.ModuleList(
                     [
@@ -439,12 +482,17 @@ class EfficientUpdateFormer(nn.Module):
 
         B, T, *_ = input_tensor.shape
 
+        num_virtual_tracks = self.num_virtual_tracks
+
         real_tokens = self.input_transform(input_tensor)
 
         if self.add_space_attn:
             virtual_tokens = repeat(self.virual_tracks, "1 n 1 c -> b n t c", b=B, t=T)
             virtual_tokens = rearrange(virtual_tokens, "b n t c -> b t n c")
-
+            if self.num_traj_groups is not None:
+                virtual_tokens = repeat(virtual_tokens.unsqueeze(2), "b t 1 n c -> b t k n c", k=self.num_traj_groups)
+                virtual_tokens = rearrange(virtual_tokens, "b t k n c -> b t (k n) c")
+                num_virtual_tracks = self.num_traj_groups * self.num_virtual_tracks
             # self.virual_tracks.repeat(B, 1, T, 1)
             tokens = torch.cat([real_tokens, virtual_tokens], dim=2)
             N_total = tokens.shape[2]
@@ -464,28 +512,56 @@ class EfficientUpdateFormer(nn.Module):
             if self.add_space_attn:
                 tokens = rearrange(tokens, "(b n) t c -> (b t) n c", b=B, t=T)
 
-                virtual_tokens = tokens[:, N_total - self.num_virtual_tracks :]
-                real_tokens = tokens[:, : N_total - self.num_virtual_tracks]
+                virtual_tokens = tokens[:, N_total - num_virtual_tracks :]
+                real_tokens = tokens[:, : N_total - num_virtual_tracks]
                 sparse_tokens = real_tokens[:, :n_sparse]
                 dense_tokens = real_tokens[:, n_sparse:]
 
-                # NOTE global attention
-                import pdb
-                pdb.set_trace()
-                if use_efficient_global_attn:
-                    sparse_mask = attn_mask[:, :n_sparse]
-                    virtual_tokens = self.space_virtual2point_blocks[lvl](virtual_tokens, sparse_tokens, mask=sparse_mask)
+                # group attn
+                if self.num_traj_groups is None:
+                    # NOTE global attention
+                    if use_efficient_global_attn:
+                        sparse_mask = attn_mask[:, :n_sparse]
+                        virtual_tokens = self.space_virtual2point_blocks[lvl](virtual_tokens, sparse_tokens, mask=sparse_mask)
+                    else:
+                        virtual_tokens = self.space_virtual2point_blocks[lvl](virtual_tokens, real_tokens, mask=attn_mask)
+
+                    virtual_tokens = self.space_virtual_blocks[lvl](virtual_tokens)
+
+                    # NOTE local attention
+                    if self.use_local_attn and use_local_attn and dH > 0 and dW > 0:
+                        dense_tokens = self.local_attention(dense_tokens, dH, dW, lvl, B, T)
+                        real_tokens = torch.cat([sparse_tokens, dense_tokens], dim=1)
+
+                    real_tokens = self.space_point2virtual_blocks[lvl](real_tokens, virtual_tokens, mask=attn_mask)
                 else:
-                    virtual_tokens = self.space_virtual2point_blocks[lvl](virtual_tokens, real_tokens, mask=attn_mask)
+                    print(self.num_traj_groups)
+                    N_real = N_total - num_virtual_tracks
+                    # 1. perm & reshape
+                    perm = torch.randperm(N_real)
+                    real_tokens_perm = real_tokens[:, perm]
+                    real_tokens_perm = rearrange(real_tokens_perm, "b (k j) c -> (b k) j c", k=self.num_traj_groups)
+                    attn_mask_perm = rearrange(attn_mask, "b (k j) -> (b k) j", k=self.num_traj_groups)
+                    virtual_tokens_perm = rearrange(virtual_tokens, "b (k j) c -> (b k) j c", k=self.num_traj_groups)
 
-                virtual_tokens = self.space_virtual_blocks[lvl](virtual_tokens)
+                    # 2. forward
+                    virtual_tokens_perm = self.space_virtual2point_blocks[lvl](virtual_tokens_perm, real_tokens_perm, mask=attn_mask_perm)
+                    # 2.1 virtual track global attn
+                    virtual_tokens_perm = rearrange(virtual_tokens, "(b k) j c -> b (k j) c", k=self.num_traj_groups)
+                    virtual_tokens_perm = self.space_virtual_blocks[lvl](virtual_tokens_perm)
+                    # 2.2 virtual track local attn
+                    virtual_tokens_perm = rearrange(virtual_tokens, "b (k j) c -> (b k) j c", k=self.num_traj_groups)
+                    virtual_tokens_perm = self.space_virtual_blocks_local[lvl](virtual_tokens_perm)
 
-                # NOTE local attention
-                if self.use_local_attn and use_local_attn and dH > 0 and dW > 0:
-                    dense_tokens = self.local_attention(dense_tokens, dH, dW, lvl, B, T)
-                    real_tokens = torch.cat([sparse_tokens, dense_tokens], dim=1)
+                    real_tokens_perm = self.space_point2virtual_blocks[lvl](real_tokens_perm, virtual_tokens_perm, mask=attn_mask_perm)
 
-                real_tokens = self.space_point2virtual_blocks[lvl](real_tokens, virtual_tokens, mask=attn_mask)
+                    # 3. perm & reshape back
+                    # 3.1 reshape
+                    attn_mask = rearrange(attn_mask_perm, "(b k) j -> b (k j)", k=self.num_traj_groups)
+                    virtual_tokens = rearrange(virtual_tokens_perm, "(b k) j c -> b (k j) c", k=self.num_traj_groups)
+                    real_tokens = rearrange(real_tokens_perm, "(b k) j c -> b (k j) c", k=self.num_traj_groups)
+                    inv_perm = torch.argsort(perm)
+                    real_tokens = real_tokens[:, inv_perm]
 
                 tokens = torch.cat([real_tokens, virtual_tokens], dim=1)
 
@@ -501,7 +577,7 @@ class EfficientUpdateFormer(nn.Module):
 
         # tokens = rearrange(tokens, '(b n) t c -> b t n c',)
         if self.add_space_attn:
-            real_tokens = tokens[:, :, : N_total - self.num_virtual_tracks]
+            real_tokens = tokens[:, :, : N_total - num_virtual_tracks]
             flow = self.flow_head(real_tokens)
         else:
             flow = self.flow_head(tokens)

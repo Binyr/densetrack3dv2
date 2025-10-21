@@ -163,7 +163,8 @@ class Corr4DCNN(nn.Module):
         out = torch.cat([out1, out2], dim=0)  # (2 * b) c h w
 
         # with CUDATimer(f"linear"):
-        out = self.linear_trans(out)
+        with torch.no_grad():
+            out = self.linear_trans(out)
 
         for i in range(len(self.out_channels)):
             # with CUDATimer(f"conv {i}"):

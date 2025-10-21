@@ -3,8 +3,14 @@
 
 
 model_name: "densetrack3dv2"
-restore_ckpt: "checkpoints/densetrack3d.pth"
+restore_ckpt: "../DELTA_densetrack3d/checkpoints/densetrack3d.pth"
 ckpt_path: logdirs/densetrack3dv2
+
+freeze_fnet: false
+freeze_corr4DCNN: false
+freeze_temperal_attn: false
+distribute_window: false
+num_traj_groups: null
 
 batch_size: 1
 num_nodes: 1
@@ -43,6 +49,8 @@ model_stride: 4
 crop_size: [384, 512]
 eval_max_seq_len: 1000
 
+dH: 16
+dW: 24
 model: DenseTrack3DV2(
     stride=${model_stride},
     window_len=${sliding_window_len},
@@ -51,6 +59,10 @@ model: DenseTrack3DV2(
     model_resolution=(${crop_size[0]}, ${crop_size[1]}),
     flash=False,
     coarse_to_fine_dense=True,
+    dH=${dH},dW=${dW},
+    freeze_fnet=${freeze_fnet},
+    freeze_corr4DCNN=${freeze_corr4DCNN},
+    num_traj_groups=${num_traj_groups}
   )
 
 accum_iter: 1

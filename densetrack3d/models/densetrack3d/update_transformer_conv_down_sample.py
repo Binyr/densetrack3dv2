@@ -291,6 +291,7 @@ class EfficientUpdateFormer(nn.Module):
         num_virtual_tracks=64,
         flash=False,
         use_local_attn=True,
+        coarse_to_fine_dense=True,
     ):
         super().__init__()
 
@@ -363,8 +364,29 @@ class EfficientUpdateFormer(nn.Module):
 
             self.local_size = 6
 
+        self.down2 = nn.Conv2d(3, 64, kernel_size=3, stride=2, padding=1)
+        down_conv2 = nn.Conv2d(3, 64, kernel_size=3, stride=2, padding=1)
+        down_conv3 = nn.Conv2d(3, 64, kernel_size=3, stride=2, padding=1)
+
+        self.down4 = nn.Sequential(
+            self.down2,
+            nn.ReLU(inplace=True),
+            down_conv2,
+        )
+        self.down8 = nn.Sequential(
+            self.down2,
+            nn.ReLU(inplace=True),
+            down_conv2,
+            nn.ReLU(inplace=True),
+            down_conv3,
+        )
+        
         # assert len(self.time_blocks) >= len(self.space_virtual2point_blocks)
         self.initialize_weights()
+
+    def down_sample_dense_traj(self, dense_tokens, downsample_factor):
+        assert downsample_factor in [2, 4, 8]
+        pass
 
     def initialize_weights(self):
         def _basic_init(module):

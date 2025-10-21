@@ -19,14 +19,14 @@ from PIL import Image
 from torchvision.transforms import ColorJitter, GaussianBlur
 from densetrack3d.utils.visualizer import Visualizer, flow_to_rgb
 import mediapy as media
-# try:
-#     from densetrack3d.datasets.s3_utils import create_client, get_client_stream, read_s3_json, read_s3_img_cv2
-#     has_s3 = True
-# except:
-#     has_s3 = False
+try:
+    from densetrack3d.datasets.s3_utils import create_client, get_client_stream, read_s3_json, read_s3_img_cv2
+    has_s3 = True
+except:
+    has_s3 = False
 
-from densetrack3d.datasets.s3_utils import create_client, get_client_stream, read_s3_json, read_s3_img_cv2
-has_s3 = True
+# from densetrack3d.datasets.s3_utils import create_client, get_client_stream, read_s3_json, read_s3_img_cv2
+# has_s3 = True
 
 class BasicDataset(torch.utils.data.Dataset):
     def __init__(
@@ -594,7 +594,7 @@ class KubricDataset(BasicDataset):
         # sample, gotit = self.getitem_helper(index)
         # return sample
     
-        try:
+        # try:
             if self.is_val:
                 sample, gotit = self.getitem_helper(index)
                 return sample
@@ -609,13 +609,13 @@ class KubricDataset(BasicDataset):
                     return sample, True
                 
                 index = (index +1) % self.__len__()
-        except:
-            if self.read_from_s3 and self.s3_client is not None:
-                del self.s3_client
-                self.s3_client = None
+        # except:
+        #     if self.read_from_s3 and self.s3_client is not None:
+        #         del self.s3_client
+        #         self.s3_client = None
 
-            index = (index + 1) % self.__len__()
-            return self.__getitem__(index)
+        #     index = (index + 1) % self.__len__()
+        #     return self.__getitem__(index)
 
     def lsq_depth(self, depth, pred_depth):
         T, H, W = depth.shape[:3] # T H W 1
@@ -689,10 +689,16 @@ class KubricDataset(BasicDataset):
                 dense_annot_dict = np.load(get_client_stream(self.s3_client, npy_dense_path), allow_pickle=True).item()
             else:
                 dense_annot_dict = np.load(npy_dense_path, allow_pickle=True).item()
-            dense_traj_2d = dense_annot_dict["reverse_coords"].astype(np.float32)
-            dense_traj_depth = dense_annot_dict["reverse_reproj_depth"].astype(np.float32)[..., None]
-            dense_visibility = dense_annot_dict["reverse_visibility"].astype(bool)
-            dense_queries = dense_annot_dict["reverse_queries"].astype(np.float32) # N, 3
+            if False:
+                dense_traj_2d = dense_annot_dict["reverse_coords"].astype(np.float32)
+                dense_traj_depth = dense_annot_dict["reverse_reproj_depth"].astype(np.float32)[..., None]
+                dense_visibility = dense_annot_dict["reverse_visibility"].astype(bool)
+                dense_queries = dense_annot_dict["reverse_queries"].astype(np.float32) # N, 3
+            else:
+                dense_traj_2d = dense_annot_dict["coords"].astype(np.float32)
+                dense_traj_depth = dense_annot_dict["reproj_depth"].astype(np.float32)[..., None]
+                dense_visibility = dense_annot_dict["visibility"].astype(bool)
+                dense_queries = dense_annot_dict["queries"].astype(np.float32) # N, 3
 
         npy_path = os.path.join(data_root_, seq_name, seq_name + ".npy")
         if self.read_from_s3:
@@ -700,10 +706,17 @@ class KubricDataset(BasicDataset):
         else:
             annot_dict = np.load(npy_path, allow_pickle=True).item()
 
-        sparse_traj_2d = annot_dict["sparse_coords"].astype(np.float32)
-        sparse_traj_depth = annot_dict["sparse_reproj_depth"].astype(np.float32)[..., None]
-        sparse_visibility = annot_dict["sparse_visibility"].astype(bool)
-        depth_range = annot_dict["depth_range"].astype(float)
+        if False: # GT do not contains these keys
+            sparse_traj_2d = annot_dict["sparse_coords"].astype(np.float32)
+            sparse_traj_depth = annot_dict["sparse_reproj_depth"].astype(np.float32)[..., None]
+            sparse_visibility = annot_dict["sparse_visibility"].astype(bool)
+            depth_range = annot_dict["depth_range"].astype(float)
+        elif True:
+            sparse_traj_2d = annot_dict["coords"].astype(np.float32)
+            sparse_traj_depth = annot_dict["reproj_depth"].astype(np.float32)[..., None]
+            sparse_visibility = annot_dict["visibility"].astype(bool)
+            sparse_queries = annot_dict["queries"].astype(np.float32)
+            depth_range = annot_dict["depth_range"].astype(float)
         # sparse_queries = annot_dict["sparse_queries"].astype(np.float32) # N, 3
 
         # if self.use_gt_depth:

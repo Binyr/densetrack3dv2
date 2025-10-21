@@ -48,6 +48,8 @@ if __name__ == '__main__':
 
 
     depth_dataset_root = os.path.join(args.dataset_root, f"cvo_test_{args.split}_depth")
+    from pathlib import Path
+    Path(depth_dataset_root).mkdir(exist_ok=True, parents=True)
     test_dataset = CVO(data_root=args.dataset_root, split=args.split, debug=False) 
 
     index = 0

@@ -165,7 +165,7 @@ if __name__ == "__main__":
     cfg = DefaultConfig()
 
     # splits = ["adt", "drivetrack", "pstudio"]
-    splits = ["adt"]
+    splits = ["pstudio"]
 
     num_gpus = min(len(splits), torch.cuda.device_count())
 

@@ -106,7 +106,7 @@ class EvaluationPredictor(torch.nn.Module):
             videodepth=videodepth,
             sparse_queries=None,
             iters=self.n_iters,
-            gt_flow=gt_flow,
+            # gt_flow=gt_flow,
         )
 
         dense_traj_e, dense_vis_e = (

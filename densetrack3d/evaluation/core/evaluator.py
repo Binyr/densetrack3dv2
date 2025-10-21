@@ -43,9 +43,10 @@ class Evaluator:
     A class defining the CoTracker evaluator.
     """
 
-    def __init__(self, exp_dir) -> None:
+    def __init__(self, exp_dir, average_gt_as_pred=False) -> None:
         # Visualization
         self.exp_dir = exp_dir
+        self.average_gt_as_pred = average_gt_as_pred
 
     def compute_metrics(self, metrics, sample, pred_traj_2d, pred_visibility, dataset_name, resolution=(384, 512)):
 
@@ -875,16 +876,53 @@ class Evaluator:
 
                 gt_flow = sample.flow
                 gt_alpha = sample.flow_alpha
-
-                with CUDATimer(f"Forward time"):
-                    flow, flow_alpha = model.forward_flow2d(
-                        video=sample.video,
-                        videodepth=sample.videodepth,
-                        dst_frame=-1 if dataset_name == "cvo" else 1,
-                        gt_flow=gt_flow
-                    )
-
                 
+                if not self.average_gt_as_pred:
+                    with CUDATimer(f"Forward time"):
+                        flow, flow_alpha = model.forward_flow2d(
+                            video=sample.video,
+                            videodepth=sample.videodepth,
+                            dst_frame=-1 if dataset_name == "cvo" else 1,
+                            gt_flow=gt_flow
+                        )
+                    if False:
+                        def avg(gt_flow):
+                            C = gt_flow.shape[-1]
+                            patch_size = 32
+                            flow = gt_flow.reshape(1, 16, 32, 16, 32, C)
+                            flow = flow.mean(dim=(2,4))
+                            return flow   
+                        flow = avg(flow)
+                        flow_alpha = avg(flow_alpha.unsqueeze(-1)).squeeze(-1)
+                        gt_flow = avg(gt_flow)
+                        gt_alpha = avg(gt_alpha.unsqueeze(-1)).squeeze(-1)
+                        print(flow.shape, gt_flow.shape)
+                else:
+                    if False:
+                        def avg_and_upsample(gt_flow):
+                            C = gt_flow.shape[-1]
+                            patch_size = 32
+                            flow = gt_flow.reshape(1, 16, 32, 16, 32, C)
+                            flow = flow.mean(dim=(2,4))
+                            flow = flow.permute(0, 3, 1, 2) 
+                            flow = torch.nn.functional.interpolate(flow, scale_factor=32)
+                            flow = flow.permute(0, 2, 3, 1)
+                            return flow
+                        flow = avg_and_upsample(gt_flow)
+                        flow_alpha = avg_and_upsample(gt_alpha.unsqueeze(-1)).squeeze(-1)
+                    else:
+                        def avg(gt_flow):
+                            C = gt_flow.shape[-1]
+                            patch_size = 32
+                            flow = gt_flow.reshape(1, 16, 32, 16, 32, C)
+                            flow = flow.mean(dim=(2,4))
+                            return flow
+                        flow = avg(gt_flow)
+                        flow_alpha = avg(gt_alpha.unsqueeze(-1)).squeeze(-1)
+                        gt_flow = gt_flow[:, ::32, ::32]
+                        gt_alpha = gt_alpha[:, ::32, ::32]
+
+            
 
             if dataset_name == "cvo":
                 out_metrics = compute_cvo_metrics(

@@ -24,7 +24,7 @@ from densetrack3d.models.densetrack3d.densetrack3dv2 import DenseTrack3DV2
 from densetrack3d.utils.io import load_checkpoint
 from omegaconf import OmegaConf
 
-CVO_DIR = None # FIXME: replace the path to the CVOs dataset here
+CVO_DIR = "datasets/cvo/" # FIXME: replace the path to the CVOs dataset here
 
 @dataclass(eq=False)
 class DefaultConfig:
@@ -34,6 +34,7 @@ class DefaultConfig:
     dataset_root: str = CVO_DIR
 
     checkpoint: str = "checkpoints/densetrack3dv2.pth"
+    # checkpoint: str = "logdirs/densetrack3dv2/model_densetrack3dv2_005628.pth" 
     # EvaluationPredictor parameters
     # The size (N) of the support grid used in the predictor.q
     # The total number of points is (N*N).
@@ -79,7 +80,8 @@ class RayPredictor:
             add_space_attn=True,
             num_virtual_tracks=64,
             model_resolution=(384, 512),
-            coarse_to_fine_dense=True
+            coarse_to_fine_dense=True,
+            # num_traj_groups=4,
         )
         
 
@@ -141,6 +143,14 @@ class RayPredictor:
 cs = hydra.core.config_store.ConfigStore.instance()
 cs.store(name="default_config_eval", node=DefaultConfig)
 
+def parser_args():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ckpt", type=str, required=True)
+    parser.add_argument("--exp_dir", type=str, required=True)
+    parser.add_argument("--n_iters", type=int, default=4)
+    args = parser.parse_args()
+    return args
 
 if __name__ == "__main__":
     torch.manual_seed(0)
@@ -148,15 +158,20 @@ if __name__ == "__main__":
 
     cfg = DefaultConfig()
 
+    args = parser_args()
+    cfg.checkpoint = args.ckpt
+    cfg.exp_dir = args.exp_dir
+    cfg.n_iters = args.n_iters
     # splits = ["clean", "final", "extended"]
-    splits = ["clean"]
+    splits = ["clean", "extended"]
 
     num_gpus = min(len(splits), torch.cuda.device_count())
 
     print(f"Using {num_gpus} GPUs")
 
     predictor = RayPredictor(worker_id=0, cfg=cfg)
-    predictor.run_eval(splits[0])
+    for split in splits:
+        predictor.run_eval(split)
 
     # ray.init()
     # predictors = [RayPredictor.remote(i, cfg) for i in range(num_gpus)]

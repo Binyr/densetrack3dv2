@@ -57,7 +57,7 @@ from collections import defaultdict, OrderedDict
 
 TAPVID2D_DIR = None
 # KUBRIC3D_MIX_DIR = "datasets/kubric/movif_512x512_dense_3d_processed/"
-KUBRIC3D_MIX_DIR = None
+KUBRIC3D_MIX_DIR = "datasets/kubric_DELTA/movif/kubric_processed_mix_3d/"
 
 logging.getLogger('boto3').setLevel(logging.CRITICAL)
 logging.getLogger('botocore').setLevel(logging.CRITICAL)
@@ -101,7 +101,7 @@ def sample_sparse_queries(trajs_g, trajs_d, vis_g):
     return sparse_queries
 
 
-def forward_batch(batch, model, args):
+def forward_batch(batch, model, args, accelerator=None):
     model_stride = args.model_stride
 
     video = batch.video
@@ -128,7 +128,6 @@ def forward_batch(batch, model, args):
 
     sparse_queries = sample_sparse_queries(trajs_g, trajs_d, vis_g)
     n_sparse_queries = sparse_queries.shape[1]
-
     #############################
     # n_input_queries = 256
     # NOTE add regular grid queries:
@@ -139,7 +138,7 @@ def forward_batch(batch, model, args):
 
     grid_queries = torch.cat([grid_xy, grid_xy_d], dim=-1)
     input_queries = torch.cat([sparse_queries, grid_queries], dim=1)
-
+    # input_queries = sparse_queries
     # with torch.amp.autocast(device_type=device.type, enabled=True):
     sparse_predictions, dense_predictions, (sparse_train_data_dict, dense_train_data_dict) = model(
         video=video,
@@ -149,6 +148,7 @@ def forward_batch(batch, model, args):
         iters=args.train_iters,
         is_train=True,
         use_dense=True,
+        accelerator=accelerator,
     )
 
     coord_predictions = sparse_train_data_dict["coords"]
@@ -438,11 +438,12 @@ def train(args):
         data_root=KUBRIC3D_MIX_DIR,
         crop_size=(384, 512),
         seq_len=24,
-        traj_per_sample=256,
+        traj_per_sample=args.traj_per_sample,
         sample_vis_1st_frame=True,
         use_augs=not args.dont_use_augs,
         use_gt_depth=True,
-        read_from_s3=True
+        # read_from_s3=True,
+        read_from_s3=False
     )
 
 
@@ -457,9 +458,49 @@ def train(args):
         collate_fn=collate_fn_train,
         drop_last=True,
     )
+    
+    # binyanrui - freeze some layer
+    # results in slow training
+    print("binyanrui")
+    for name, p in model.named_parameters():
+        if args.freeze_fnet and name.startswith("fnet"):
+            p.requires_grad = False
+        
+        if args.freeze_corr4DCNN and name.startswith("cmdtop"):
+            p.requires_grad = False
+
+        if args.freeze_temperal_attn and name.startswith("updateformer.time_blocks"):
+            p.requires_grad = False
+        
+        # if name.startswith("upsample_transformer"):
+        #     p.requires_grad = False
+        # if name.startswith("inter_up"):
+        #     p.requires_grad = False
+        
+
+        # if name.startswith("norm"):
+        #     p.requires_grad = False
+        # if name.startswith("track_feat_updater"):
+        #     p.requires_grad = False
+        # if name.startswith("updateformer.virual_tracks"):
+        #     p.requires_grad = False
+        # if name.startswith("updateformer.input_transform"):
+        #     p.requires_grad = False
+        # if name.startswith("updateformer.flow_head"):
+        #     p.requires_grad = False
+        # if name.startswith("vis_predictor"):
+        #     p.requires_grad = False
+        # if name.startswith("conf_predictor"):
+        #     p.requires_grad = False
+        # p.requires_grad = False
+        # if name.startswith("updateformer.space"):
+        #     p.requires_grad = True
+        
+        # if p.requires_grad:
+        #     print(name)
+    # binyanrui
 
     # optimizer, scheduler = fetch_optimizer(args, model)
-
     optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=args.lr, weight_decay=args.wdecay, eps=1e-8)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
@@ -508,9 +549,14 @@ def train(args):
         model_state_dict = model.state_dict()
         new_state_dict = {}
         for k, v in state_dict.items():
-            # if k in model_state_dict and v.shape == model_state_dict[k].shape:
-            #     new_state_dict[k] = v
-            new_state_dict[k] = v
+            if k in model_state_dict and v.shape == model_state_dict[k].shape:
+                new_state_dict[k] = v
+            else:
+                if k in model_state_dict:
+                    print(f"{k} can not load. ckpt shape {v.shape} vs model shape {model_state_dict[k].shape}")
+                else:
+                    print(f"unexpected key {k}")
+            # new_state_dict[k] = v
 
         print(model.load_state_dict(new_state_dict, strict=strict))
         logging.info(f"Done loading checkpoint")
@@ -546,29 +592,30 @@ def train(args):
         os.makedirs(save_video_dir, exist_ok=True)
         logger = Logger(save_path=os.path.join(args.ckpt_path, "runs"))
 
-    eval_dataloaders = []
+    if False:
+        eval_dataloaders = []
 
-    eval_davis_dataset = TapVid2DDataset(
-        data_root=TAPVID2D_DIR,
-        dataset_type="davis",
-        resize_to_256=True,
-        queried_first=True,
-        read_from_s3=False,
-        num_processes=accelerator.num_processes
-    )
+        eval_davis_dataset = TapVid2DDataset(
+            data_root=TAPVID2D_DIR,
+            dataset_type="davis",
+            resize_to_256=True,
+            queried_first=True,
+            read_from_s3=False,
+            num_processes=accelerator.num_processes
+        )
 
-    eval_davis_dataloader = torch.utils.data.DataLoader(
-        eval_davis_dataset,
-        batch_size=1,
-        shuffle=False,
-        num_workers=1,
-        collate_fn=collate_fn,
-        drop_last=True,
-    )
-    eval_davis_dataloader = accelerator.prepare(eval_davis_dataloader)
-    eval_dataloaders.append(("tapvid_davis_first", eval_davis_dataloader))
+        eval_davis_dataloader = torch.utils.data.DataLoader(
+            eval_davis_dataset,
+            batch_size=1,
+            shuffle=False,
+            num_workers=1,
+            collate_fn=collate_fn,
+            drop_last=True,
+        )
+        eval_davis_dataloader = accelerator.prepare(eval_davis_dataloader)
+        eval_dataloaders.append(("tapvid_davis_first", eval_davis_dataloader))
 
-    evaluator = Evaluator(save_video_dir)
+        evaluator = Evaluator(save_video_dir)
 
     save_freq = args.save_freq
     # scaler = GradScaler(device="cuda", enabled=False)
@@ -600,7 +647,7 @@ def train(args):
 
                 assert model.training
 
-                output = forward_batch(batch, model, args)
+                output = forward_batch(batch, model, args, accelerator=accelerator if args.distribute_window else None)
 
                 loss = 0
                 for k, v in output.items():
@@ -670,7 +717,7 @@ def train(args):
                 )
 
 
-        if (epoch + 1) % args.evaluate_every_n_epoch == 0 or (args.validate_at_start and epoch == 0):
+        if False and ((epoch + 1) % args.evaluate_every_n_epoch == 0 or (args.validate_at_start and epoch == 0)):
 
             model.eval()
             predictor = EvaluationPredictor(
@@ -745,7 +792,7 @@ def train(args):
 @hydra.main(
     version_base=None,
     config_path=os.path.join(str(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))), "configs"),
-    config_name="train.yaml",
+    config_name="densetrack3dv2.yaml",
 )
 def run(cfg: OmegaConf):
     OmegaConf.resolve(cfg)

@@ -13,8 +13,7 @@ import random
 import os
 from densetrack3d.models.densetrack3d.blocks import BasicEncoder, Mlp
 from densetrack3d.models.densetrack3d.corr4d_blocks import Corr4DMLP, Corr4DCNN
-# from densetrack3d.models.densetrack3d.update_transformer import EfficientUpdateFormer
-from densetrack3d.models.densetrack3d.update_transformer_random_group import EfficientUpdateFormer
+from densetrack3d.models.densetrack3d.update_transformer import EfficientUpdateFormer
 from densetrack3d.models.densetrack3d.upsample_transformer import UpsampleTransformerAlibi
 from densetrack3d.models.densetrack3d.interpolator import LearnableInterpolator
 from densetrack3d.models.embeddings import get_1d_sincos_pos_embed_from_grid, get_2d_embedding, get_2d_sincos_pos_embed
@@ -59,9 +58,6 @@ class DenseTrack3DV2(nn.Module):
         flash=False,
         coarse_to_fine_dense=True,
         dH=16, dW=24,
-        freeze_fnet=False,
-        freeze_corr4DCNN=False,
-        num_traj_groups=None,
     ):
         super().__init__()
         self.window_len = window_len
@@ -75,8 +71,6 @@ class DenseTrack3DV2(nn.Module):
 
         self.dH_train = dH
         self.dW_train = dW
-        self.freeze_fnet = freeze_fnet
-        self.freeze_corr4DCNN = freeze_corr4DCNN
 
         self.fnet = BasicEncoder(
             input_dim=3, 
@@ -96,8 +90,7 @@ class DenseTrack3DV2(nn.Module):
             add_space_attn=add_space_attn,
             num_virtual_tracks=num_virtual_tracks,
             flash=flash,
-            use_local_attn=False,
-            num_traj_groups=num_traj_groups,
+            use_local_attn=False
         )
 
 
@@ -278,14 +271,13 @@ class DenseTrack3DV2(nn.Module):
 
         B, S, N = coords.shape[:3]
         r = self.radius_corr
-        
+
         corrs_pyr = []
         for lvl, supp_track_feat_ in enumerate(supp_track_feat):
             centroid_lvl = coords.reshape(B * S, N, 1, 1, 2) / 2 ** (lvl - 1)
             coords_lvl = centroid_lvl + self.delta_corr[None, None]  # (B S) N (2r+1) (2r+1) 2
 
             _, _, C_, H_, W_ = fmaps_pyramid[lvl].shape
-            
             sample_tgt_feat = bilinear_sampler(
                 fmaps_pyramid[lvl].reshape(B * S, -1, H_, W_),
                 coords_lvl.reshape(B * S, N, (2 * r + 1) * (2 * r + 1), 2),
@@ -297,7 +289,43 @@ class DenseTrack3DV2(nn.Module):
             patches_input = einsum(sample_tgt_feat, supp_track_feat_, "b s c n h w, b n i j c -> b s n h w i j")
             patches_input = patches_input / torch.sqrt(torch.tensor(C_).float())
             patches_input = rearrange(patches_input, "b s n h w i j -> (b s n) h w i j")
-            
+
+            patches_emb = self.cmdtop[lvl](patches_input)
+
+            patches = rearrange(patches_emb, "(b s n) c -> b s n c", b=B, s=S)
+
+            corrs_pyr.append(patches)
+        fcorrs = torch.cat(corrs_pyr, dim=-1)  # B S N C
+
+        return fcorrs
+    
+    def get_4dcorr_features_dense(
+        self,
+        fmaps_pyramid: tuple[VideoType, ...],
+        coords: Float[Tensor, "b t n c"],
+        supp_track_feat: tuple[Float[Tensor, "*"], ...],
+    ) -> Float[Tensor, "*"]:
+
+        B, S, N = coords.shape[:3]
+        r = self.radius_corr
+        corrs_pyr = []
+        for lvl, supp_track_feat_ in enumerate(supp_track_feat):
+            centroid_lvl = coords.reshape(B * S, N, 1, 1, 2) / 2 ** (lvl - 1)
+            coords_lvl = centroid_lvl + self.delta_corr[None, None]  # (B S) N (2r+1) (2r+1) 2
+
+            _, _, C_, H_, W_ = fmaps_pyramid[lvl].shape
+            sample_tgt_feat = bilinear_sampler(
+                fmaps_pyramid[lvl].reshape(B * S, -1, H_, W_),
+                coords_lvl.reshape(B * S, N, (2 * r + 1) * (2 * r + 1), 2),
+                padding_mode="border",
+            )
+
+            sample_tgt_feat = sample_tgt_feat.view(B, S, -1, N, 2 * r + 1, 2 * r + 1)
+
+            patches_input = einsum(sample_tgt_feat, supp_track_feat_, "b s c n h w, b n i j c -> b s n h w i j")
+            patches_input = patches_input / torch.sqrt(torch.tensor(C_).float())
+            patches_input = rearrange(patches_input, "b s n h w i j -> (b s n) h w i j")
+
             patches_emb = self.cmdtop[lvl](patches_input)
 
             patches = rearrange(patches_emb, "(b s n) c -> b s n c", b=B, s=S)
@@ -400,11 +428,7 @@ class DenseTrack3DV2(nn.Module):
     ):
         B, S, N = coords.shape[:3]
         # NOTE Prepare input to transformer
-        if self.freeze_corr4DCNN:
-            with torch.no_grad():
-                fcorrs = self.get_4dcorr_features(fmaps_pyramid, coords, supp_track_feat)
-        else:
-            fcorrs = self.get_4dcorr_features(fmaps_pyramid, coords, supp_track_feat)
+        fcorrs = self.get_4dcorr_features(fmaps_pyramid, coords, supp_track_feat)
 
         with torch.no_grad():
             dcorrs = self.get_single_corr_depth(depthmaps, coords, coord_depths)
@@ -796,7 +820,6 @@ class DenseTrack3DV2(nn.Module):
             if self.upsample_factor == 4:
                 # dH, dW = 15, 20
                 dH, dW = self.dH_train, self.dW_train
-                # print(dH, dW)
                 # dH, dW = 24, 32
             else:
                 dH, dW = 9, 12
@@ -876,7 +899,6 @@ class DenseTrack3DV2(nn.Module):
         is_train: bool = False,
         use_dense: bool = True,
         use_efficient_global_attn: bool = False,
-        accelerator = None,
     ) -> tuple[dict | None, dict | None, tuple[dict | None, dict | None] | None]:
         """Predict tracks
 
@@ -924,11 +946,7 @@ class DenseTrack3DV2(nn.Module):
         if depth_init is None:
             depth_init = videodepth[:, 0].clone()
 
-        if self.freeze_fnet:
-            with torch.no_grad():
-                fmaps, higher_fmaps, lower_fmaps = self.extract_features(video)
-        else:
-            fmaps, higher_fmaps, lower_fmaps = self.extract_features(video)
+        fmaps, higher_fmaps, lower_fmaps = self.extract_features(video)
         fmaps_pyramid = [higher_fmaps, fmaps, lower_fmaps]
         fH, fW = fmaps.shape[-2:]
 
@@ -1108,34 +1126,22 @@ class DenseTrack3DV2(nn.Module):
                 attention_mask = smart_cat(
                     attention_mask, torch.ones((B, S, self.dH * self.dW), device=device), dim=2
                 ).bool()
-            
-            activate_fst_window = accelerator.process_index % 2 == 0 if accelerator is not None else None
-            class blank_contexts:
-                def __enter__(self):
-                    pass
-                def __exit__(self, *args):
-                    pass
-            if accelerator is None or (activate_fst_window and ind == 0) or ((not activate_fst_window) and ind > 0):
-                context_manager = blank_contexts()
-            else:
-                context_manager = torch.no_grad()
-            with context_manager:
-            # if True:
-                coords, coords_depths, vis, conf, track_feat_updated = self.forward_window(
-                    fmaps_pyramid=[f[:, ind : ind + S] for f in fmaps_pyramid],
-                    depthmaps=videodepth_downsample[:, ind : ind + S],
-                    coords=coords_init,
-                    coord_depths=depths_init,
-                    vis=vis_init,
-                    conf=conf_init,
-                    track_feat=attention_mask.unsqueeze(-1).float() * track_feat,
-                    supp_track_feat=supp_track_feats_pyramid,
-                    track_mask=track_mask,
-                    attention_mask=attention_mask,
-                    iters=iters,
-                    use_efficient_global_attn=use_efficient_global_attn,
-                    inter_up_mask_dict=inter_up_mask_dict,
-                )
+
+            coords, coords_depths, vis, conf, track_feat_updated = self.forward_window(
+                fmaps_pyramid=[f[:, ind : ind + S] for f in fmaps_pyramid],
+                depthmaps=videodepth_downsample[:, ind : ind + S],
+                coords=coords_init,
+                coord_depths=depths_init,
+                vis=vis_init,
+                conf=conf_init,
+                track_feat=attention_mask.unsqueeze(-1).float() * track_feat,
+                supp_track_feat=supp_track_feats_pyramid,
+                track_mask=track_mask,
+                attention_mask=attention_mask,
+                iters=iters,
+                use_efficient_global_attn=use_efficient_global_attn,
+                inter_up_mask_dict=inter_up_mask_dict,
+            )
 
             S_trimmed = min(T - ind, S)  # accounts for last window duration
 
