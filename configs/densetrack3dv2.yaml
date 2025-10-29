@@ -11,11 +11,14 @@ freeze_corr4DCNN: false
 freeze_temperal_attn: false
 distribute_window: false
 num_traj_groups: null
+use_dino: null
+dino_size: 1024
 
 batch_size: 1
 num_nodes: 1
 num_workers: 10
 
+bf16: false
 mixed_precision: false
 
 lr: 0.0002
@@ -62,7 +65,9 @@ model: DenseTrack3DV2(
     dH=${dH},dW=${dW},
     freeze_fnet=${freeze_fnet},
     freeze_corr4DCNN=${freeze_corr4DCNN},
-    num_traj_groups=${num_traj_groups}
+    num_traj_groups=${num_traj_groups},
+    use_dino=${use_dino},
+    dino_size=${dino_size},
   )
 
 accum_iter: 1

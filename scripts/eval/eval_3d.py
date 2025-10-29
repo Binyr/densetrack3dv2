@@ -29,7 +29,7 @@ from omegaconf import OmegaConf
 
 
 # TAPVID3D_DIR = "4d-data/dense_tracking_datasets/tapvid3d/" # FIXME: replace the path to the tapvid3d dataset here
-TAPVID3D_DIR = None
+TAPVID3D_DIR = "datasets/"
 @dataclass(eq=False)
 class DefaultConfig:
     # Directory where all outputs of the experiment will be saved.
@@ -65,6 +65,10 @@ class DefaultConfig:
         }
     )
 
+    use_dino = None
+    dino_size = 512
+    num_patch = None
+
 
 # @ray.remote(num_gpus=1)
 class RayPredictor:
@@ -88,7 +92,9 @@ class RayPredictor:
             add_space_attn=True,
             num_virtual_tracks=64,
             model_resolution=(384, 512),
-            coarse_to_fine_dense=True
+            coarse_to_fine_dense=True,
+            use_dino=self.cfg.use_dino,
+            dino_size=self.cfg.dino_size
         )
 
 
@@ -104,6 +110,7 @@ class RayPredictor:
             local_grid_size=cfg.local_grid_size,
             single_point=cfg.single_point,
             n_iters=cfg.n_iters,
+            num_patch=cfg.num_patch
         )
         predictor = predictor.eval().cuda()
 
@@ -113,7 +120,7 @@ class RayPredictor:
             use_metric_depth=True,  # FIXME check here
             split="mini",
             read_from_s3=False,
-            depth_type="zoedepth"
+            # depth_type="zoedepth"
         )
 
         test_dataloader = torch.utils.data.DataLoader(
@@ -157,6 +164,17 @@ class RayPredictor:
 cs = hydra.core.config_store.ConfigStore.instance()
 cs.store(name="default_config_eval", node=DefaultConfig)
 
+def parser_args():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ckpt", type=str, required=True)
+    parser.add_argument("--exp_dir", type=str, required=True)
+    parser.add_argument("--n_iters", type=int, default=6)
+    parser.add_argument("--use_dino", type=int, default=None)
+    parser.add_argument("--dino_size", type=int, default=512)
+    parser.add_argument("--num_patch", type=int, default=None)
+    args = parser.parse_args()
+    return args
 
 if __name__ == "__main__":
     torch.manual_seed(0)
@@ -164,6 +182,13 @@ if __name__ == "__main__":
 
     cfg = DefaultConfig()
 
+    args = parser_args()
+    cfg.checkpoint = args.ckpt
+    cfg.exp_dir = args.exp_dir
+    cfg.n_iters = args.n_iters
+    cfg.use_dino = args.use_dino
+    cfg.dino_size = args.dino_size
+    cfg.num_patch = args.num_patch
     # splits = ["adt", "drivetrack", "pstudio"]
     splits = ["pstudio"]
 

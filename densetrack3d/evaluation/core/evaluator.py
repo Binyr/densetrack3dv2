@@ -38,6 +38,14 @@ from tqdm import tqdm
 from densetrack3d.utils.timer import CUDATimer
 
 
+def gt_flow_to_traj(gt_flow):
+    B, T, H, W, C = gt_flow.shape
+    assert T == 1 and C == 2
+    ori_grid = get_grid(H, W, normalize=False).to(gt_flow.device)
+    gt_traj = gt_flow + ori_grid.unsqueeze(0).unsqueeze(0)
+    return gt_traj
+
+
 class Evaluator:
     """
     A class defining the CoTracker evaluator.
@@ -623,9 +631,10 @@ class Evaluator:
                 save_dir=self.exp_dir,
                 fps=10,
                 show_first_frame=0,
+                tracks_leave_trace=4
             )
 
-        for ind, sample in enumerate(test_dataloader):
+        for ind, sample in tqdm(enumerate(test_dataloader)):
             if isinstance(sample, tuple):
                 sample, gotit = sample
                 if not all(gotit):
@@ -700,6 +709,21 @@ class Evaluator:
             scaled_pred_traj_3d = self.compute_metrics_3d(metrics, sample, traj_3d, vis_e, dataset_name)
             if verbose:
                 print("Avg:", metrics["avg"])
+            
+            # binyanrui: vis
+            if False:
+                trajs_g = sample.trajectory
+                trajs_e = traj_e
+                vis.visualize(
+                    video=sample.video,
+                    tracks=trajs_e,
+                    gt_tracks=trajs_g,
+                    filename=sample.seq_name[0]
+                )
+
+
+
+        
         return metrics
 
     @torch.no_grad()
@@ -813,10 +837,10 @@ class Evaluator:
     ):
         metrics = {}
 
-        # vis = Visualizer(
-        #     save_dir=self.exp_dir,
-        #     fps=7,
-        # )
+        vis = Visualizer(
+            save_dir=self.exp_dir,
+            fps=7,
+        )
 
         filter_indices = [
             70,
@@ -847,7 +871,6 @@ class Evaluator:
         ]
 
         for ind, sample in enumerate(tqdm(test_dataloader)):
-
             if ind in filter_indices and split in ["clean", "final"] and dataset_name == "cvo":
                 continue
             if isinstance(sample, tuple):
@@ -879,12 +902,50 @@ class Evaluator:
                 
                 if not self.average_gt_as_pred:
                     with CUDATimer(f"Forward time"):
-                        flow, flow_alpha = model.forward_flow2d(
+                        flow, flow_alpha, dense_traj_e_vis, dense_vis_e_vis = model.forward_flow2d(
                             video=sample.video,
                             videodepth=sample.videodepth,
                             dst_frame=-1 if dataset_name == "cvo" else 1,
-                            gt_flow=gt_flow
+                            gt_flow=gt_flow,
+                            vis=True
                         )
+
+                        # binyanrui: vis
+                        if False:
+                            gt_traj = sample.trajectory
+                            gt_traj = gt_flow_to_traj(gt_traj)
+                            gt_traj = gt_traj.repeat(1, dense_traj_e_vis.shape[1], 1, 1, 1) # from 1,1,h,w,c -> 1,T,h,w,c
+                            gt_traj[:, 0] = dense_traj_e_vis[:, 0]
+
+                            # find inaccurate traj
+                            diff = torch.linalg.norm(dense_traj_e_vis[:, -1] - gt_traj[:, -1], dim=-1)
+                            mask = diff > 5
+                            selected_dense_traj_e_vis = dense_traj_e_vis[:, :, mask[0], :]
+                            selected_dense_vis_e_vis = dense_vis_e_vis[:, :, mask[0]]
+                            print(selected_dense_traj_e_vis.shape)
+
+                            selected_dense_traj_e_vis = selected_dense_traj_e_vis[:, :, ::30]
+
+                            # downsample
+                            vis_downsample_step = 8
+                            dense_traj_e_vis = dense_traj_e_vis[:, :, ::vis_downsample_step, ::vis_downsample_step]
+                            dense_vis_e_vis = dense_vis_e_vis[:, :, ::vis_downsample_step, ::vis_downsample_step]
+                            dense_traj_e_vis = rearrange(dense_traj_e_vis, "b t h w c -> b t (h w) c")
+                            dense_vis_e_vis = rearrange(dense_vis_e_vis, "b t h w -> b t (h w) 1")
+
+                            gt_traj = gt_traj[:, :, ::vis_downsample_step, ::vis_downsample_step]
+                            gt_traj = rearrange(gt_traj, "b t h w c -> b t (h w) c")
+
+                            vis.visualize_byr(
+                                video=sample.video,  # (B,T,C,H,W)
+                                tracks=dense_traj_e_vis,  # (B,T,N,2)
+                                visibility=None, # dense_vis_e_vis,  # (B, T, N, 1) bool
+                                gt_tracks=gt_traj,  # (B,T,N,2)
+                                filename=sample.seq_name[0],
+                                writer=None,  # tensorboard Summary Writer, used for visualization during training
+                                gt_tracks2=selected_dense_traj_e_vis,
+                            )
+                        # binyanrui: vis
                     if False:
                         def avg(gt_flow):
                             C = gt_flow.shape[-1]
@@ -944,6 +1005,7 @@ class Evaluator:
             if verbose:
                 print("Current:", out_metrics)
                 print("Avg:", metrics["avg"])
+            
         # print("Final:", metrics["avg"])
 
         return metrics

@@ -160,8 +160,11 @@ class CVO(Dataset):
 
         segs = torch.ones(T, 1, H, W).float()
 
-        trajectory = torch.zeros(T, 1, 2).float()
+        # trajectory = torch.zeros(T, 1, 2).float()
+        trajectory = torch.from_numpy(sample["bflows"].copy())
+        trajectory = rearrange(trajectory, "h w (t c) -> t h w c", c=2)
         visibility = torch.zeros(T, 1).float()
+        
 
         data = DeltaData(
             video=video,

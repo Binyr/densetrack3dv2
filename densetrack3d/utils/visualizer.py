@@ -151,7 +151,84 @@ class Visualizer:
         if save_video:
             self.save_video(res_video, filename=filename, writer=writer, step=step)
         return res_video
+    
+    def visualize_byr(
+        self,
+        video: torch.Tensor,  # (B,T,C,H,W)
+        tracks: torch.Tensor,  # (B,T,N,2)
+        visibility: torch.Tensor = None,  # (B, T, N, 1) bool
+        gt_tracks: torch.Tensor = None,  # (B,T,N,2)
+        segm_mask: torch.Tensor = None,  # (B,1,H,W)
+        filename: str = "video",
+        writer=None,  # tensorboard Summary Writer, used for visualization during training
+        step: int = 0,
+        query_frame: int = 0,
+        save_video: bool = True,
+        compensate_for_camera_motion: bool = False,
+        default_color: np.ndarray = None,
+        gt_tracks2=None,
+    ):
+        if compensate_for_camera_motion:
+            assert segm_mask is not None
+        if segm_mask is not None:
+            coords = tracks[0, query_frame].round().long()
+            segm_mask = segm_mask[0, query_frame][coords[:, 1], coords[:, 0]].long()
 
+        video = F.pad(
+            video,
+            (self.pad_value, self.pad_value, self.pad_value, self.pad_value),
+            "constant",
+            255,
+        )
+        tracks = tracks + self.pad_value
+
+        if self.grayscale:
+            transform = transforms.Grayscale()
+            video = transform(video)
+            video = video.repeat(1, 1, 3, 1, 1)
+
+        res_video = self.draw_tracks_on_video(
+            video=video,
+            tracks=tracks,
+            visibility=visibility,
+            segm_mask=segm_mask,
+            gt_tracks=None,
+            query_frame=query_frame,
+            compensate_for_camera_motion=compensate_for_camera_motion,
+            default_color=default_color,
+        )
+        
+        res_video = torch.cat([video.cpu(), res_video], dim=4)
+        if gt_tracks is not None:
+            res_video_gt = self.draw_tracks_on_video(
+                video=video,
+                tracks=gt_tracks,
+                visibility=visibility,
+                segm_mask=segm_mask,
+                gt_tracks=None,
+                query_frame=query_frame,
+                compensate_for_camera_motion=compensate_for_camera_motion,
+                default_color=default_color,
+            )
+            res_video = torch.cat([res_video, res_video_gt], dim=4)
+        
+        if gt_tracks2 is not None:
+            res_video_gt = self.draw_tracks_on_video(
+                video=video,
+                tracks=gt_tracks2,
+                visibility=visibility,
+                segm_mask=segm_mask,
+                gt_tracks=None,
+                query_frame=query_frame,
+                compensate_for_camera_motion=compensate_for_camera_motion,
+                default_color=default_color,
+            )
+            res_video = torch.cat([res_video, res_video_gt], dim=4)
+
+        if save_video:
+            self.save_video(res_video, filename=filename, writer=writer, step=step)
+        return res_video
+    
     def save_video(self, video, filename, writer=None, step=0):
         if writer is not None:
             writer.add_video(
@@ -283,8 +360,8 @@ class Visualizer:
                     curr_tracks,
                     curr_colors,
                 )
-                if gt_tracks is not None:
-                    res_video[t] = self._draw_gt_tracks(res_video[t], gt_tracks[first_ind : t + 1])
+                # if gt_tracks is not None:
+                #     res_video[t] = self._draw_gt_tracks(res_video[t], gt_tracks[first_ind : t + 1])
 
         #  draw points
         for t in range(query_frame, T):
@@ -304,6 +381,10 @@ class Visualizer:
                         visible=visibile,
                     )
             res_video[t] = np.array(img)
+        
+        if gt_tracks is not None:
+            for t in range(query_frame, T):
+                res_video[t] = self._draw_gt_tracks(res_video[t], gt_tracks[t : t + 1])
 
         #  construct the final rgb sequence
         if self.show_first_frame > 0:
@@ -347,14 +428,15 @@ class Visualizer:
         T, N, _ = gt_tracks.shape
         color = np.array((211, 0, 0))
         rgb = Image.fromarray(np.uint8(rgb))
+        
         for t in range(T):
             for i in range(N):
-                gt_tracks = gt_tracks[t][i]
+                gt_track = gt_tracks[t][i]
                 #  draw a red cross
-                if gt_tracks[0] > 0 and gt_tracks[1] > 0:
+                if gt_track[0] > 0 and gt_track[1] > 0:
                     length = self.linewidth * 3
-                    coord_y = (int(gt_tracks[0]) + length, int(gt_tracks[1]) + length)
-                    coord_x = (int(gt_tracks[0]) - length, int(gt_tracks[1]) - length)
+                    coord_y = (int(gt_track[0]) + length, int(gt_track[1]) + length)
+                    coord_x = (int(gt_track[0]) - length, int(gt_track[1]) - length)
                     rgb = draw_line(
                         rgb,
                         coord_y,
@@ -362,8 +444,8 @@ class Visualizer:
                         color,
                         self.linewidth,
                     )
-                    coord_y = (int(gt_tracks[0]) - length, int(gt_tracks[1]) + length)
-                    coord_x = (int(gt_tracks[0]) + length, int(gt_tracks[1]) - length)
+                    coord_y = (int(gt_track[0]) - length, int(gt_track[1]) + length)
+                    coord_x = (int(gt_track[0]) + length, int(gt_track[1]) - length)
                     rgb = draw_line(
                         rgb,
                         coord_y,

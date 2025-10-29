@@ -59,6 +59,10 @@ class DefaultConfig:
         }
     )
 
+    use_dino = None
+    dino_size = 512
+    num_patch = None
+
 
 class RayPredictor:
     def __init__(
@@ -82,6 +86,8 @@ class RayPredictor:
             model_resolution=(384, 512),
             coarse_to_fine_dense=True,
             # num_traj_groups=4,
+            use_dino=self.cfg.use_dino,
+            dino_size=self.cfg.dino_size
         )
         
 
@@ -98,6 +104,7 @@ class RayPredictor:
             local_grid_size=cfg.local_grid_size,
             single_point=cfg.single_point,
             n_iters=cfg.n_iters,
+            num_patch=cfg.num_patch
         )
         predictor = predictor.eval().cuda()
 
@@ -149,6 +156,9 @@ def parser_args():
     parser.add_argument("--ckpt", type=str, required=True)
     parser.add_argument("--exp_dir", type=str, required=True)
     parser.add_argument("--n_iters", type=int, default=4)
+    parser.add_argument("--use_dino", type=int, default=None)
+    parser.add_argument("--dino_size", type=int, default=512)
+    parser.add_argument("--num_patch", type=int, default=None)
     args = parser.parse_args()
     return args
 
@@ -162,8 +172,12 @@ if __name__ == "__main__":
     cfg.checkpoint = args.ckpt
     cfg.exp_dir = args.exp_dir
     cfg.n_iters = args.n_iters
+    cfg.use_dino = args.use_dino
+    cfg.dino_size = args.dino_size
+    cfg.num_patch = args.num_patch
     # splits = ["clean", "final", "extended"]
     splits = ["clean", "extended"]
+    # splits = ["extended"]
 
     num_gpus = min(len(splits), torch.cuda.device_count())
 

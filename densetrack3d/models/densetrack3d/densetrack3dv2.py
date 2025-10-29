@@ -25,7 +25,8 @@ from densetrack3d.models.model_utils import (
     sample_features5d,
     smart_cat,
 )
-
+from densetrack3d.utils.dinov3_encoder import DINOv3_Encoder
+from densetrack3d.utils.chrono_track_model import LocoTrack
 
 VideoType = Float[Tensor, "b t c h w"]
 
@@ -62,6 +63,8 @@ class DenseTrack3DV2(nn.Module):
         freeze_fnet=False,
         freeze_corr4DCNN=False,
         num_traj_groups=None,
+        use_dino=None,
+        dino_size=1024,
     ):
         super().__init__()
         self.window_len = window_len
@@ -77,6 +80,8 @@ class DenseTrack3DV2(nn.Module):
         self.dW_train = dW
         self.freeze_fnet = freeze_fnet
         self.freeze_corr4DCNN = freeze_corr4DCNN
+        self.use_dino = use_dino
+        self.dino_size = dino_size
 
         self.fnet = BasicEncoder(
             input_dim=3, 
@@ -84,9 +89,37 @@ class DenseTrack3DV2(nn.Module):
             stride=self.stride,
         )
 
+        if self.use_dino == 3:
+            self.dino_net = DINOv3_Encoder(size=dino_size)
+            self.latent_dim += 1024
+        elif self.use_dino == 4:
+            model_kwargs = {"dino_size": "base", "dino_reg": False, "adapter_intermed_channels": 128}
+            self.dino_net = LocoTrack(**model_kwargs)
+            state_dict = torch.load("/mnt/shared-storage-user/idc2-shared/binyanrui/pretrained_models/chrono_tracking/chrono_base.ckpt", map_location=torch.device('cpu'))
+            state_dict = state_dict["state_dict"]
+            new_state_dict = {}
+            for k, v in state_dict.items():
+                if k in ["model.occ_linear.weight", "model.occ_linear.bias"]:
+                    continue
+                if k.startswith("model."):
+                    new_state_dict[k[6:]] = v
+                else:
+                    new_state_dict[k] = v
+            state_dict = new_state_dict
+            missing_keys, unexpected_keys = self.dino_net.load_state_dict(state_dict, strict=False)
+            print(f"unexpected_keys: {unexpected_keys}")
+            print(f"missing_keys: {missing_keys}")
+            # self.dino_net = self.dino_net.to(self.fnet.device)
+            self.latent_dim += 768
+
         self.num_virtual_tracks = num_virtual_tracks
         self.model_resolution = model_resolution
-        self.input_dim = 1032
+        if not use_dino:
+            self.input_dim = 1032  
+        elif use_dino == 3:
+            self.input_dim = 1032 + 1024
+        elif use_dino == 4:
+            self.input_dim = 1032 + 768
         self.updateformer = EfficientUpdateFormer(
             num_blocks=6, #
             input_dim=self.input_dim,
@@ -431,6 +464,7 @@ class DenseTrack3DV2(nn.Module):
         
         # x = transformer_input + pos_emb[:, None] + self.time_emb[:, :, None]
         # x = transformer_input + pos_emb[:, None] + self.time_emb[:, :S, None]
+        
         x = transformer_input + pos_emb[:, None] + time_emb[:, :, None]
 
         # NOTE Transformer part
@@ -620,6 +654,7 @@ class DenseTrack3DV2(nn.Module):
                 track_mask_vis_new = torch.cat([track_mask_vis[:, :, : self.N_sparse, :], concat_feat[...,1:]], dim=2)
 
                 # NOTE Prepare input to transformer
+                C1, C2, C3 = supp_track_feat[0][:, self.N_sparse:].shape[-1], supp_track_feat[1][:, self.N_sparse:].shape[-1], supp_track_feat[2][:, self.N_sparse:].shape[-1], 
                 supp_track_feat_concat = torch.cat([supp_track_feat[0][:, self.N_sparse:], supp_track_feat[1][:, self.N_sparse:], supp_track_feat[2][:, self.N_sparse:]], dim=-1)
                 supp_track_feat_concat = rearrange(supp_track_feat_concat, "b (h w) r1 r2 c -> b h w r1 r2 c", h=self.dH, w=self.dW)
                 supp_track_feat_concat = supp_track_feat_concat[:, ::downsample_factor, ::downsample_factor]
@@ -627,9 +662,9 @@ class DenseTrack3DV2(nn.Module):
                 supp_track_feat_concat = rearrange(supp_track_feat_concat, "b h w r1 r2 c -> b (h w) r1 r2 c")
 
                 supp_track_feat_new = [
-                    torch.cat([supp_track_feat[0][:, :self.N_sparse], supp_track_feat_concat[..., :64]], dim=1),
-                    torch.cat([supp_track_feat[1][:, :self.N_sparse], supp_track_feat_concat[..., 64:64+128]], dim=1),
-                    torch.cat([supp_track_feat[2][:, :self.N_sparse], supp_track_feat_concat[..., 64+128:]], dim=1)
+                    torch.cat([supp_track_feat[0][:, :self.N_sparse], supp_track_feat_concat[..., :C1]], dim=1),
+                    torch.cat([supp_track_feat[1][:, :self.N_sparse], supp_track_feat_concat[..., C1:C1+C2]], dim=1),
+                    torch.cat([supp_track_feat[2][:, :self.N_sparse], supp_track_feat_concat[..., C1+C2:]], dim=1)
                 ]
 
                 delta = self.temporal_compress(
@@ -729,7 +764,29 @@ class DenseTrack3DV2(nn.Module):
         fmaps = rearrange(fmaps, "(b t) c h w -> b t c h w", b=B, t=T)
         higher_fmaps = rearrange(higher_fmaps, "(b t) c h w -> b t c h w", b=B, t=T)
         lower_fmaps = rearrange(lower_fmaps, "(b t) c h w -> b t c h w", b=B, t=T)
+        
+        if self.use_dino:
+            ret = [fmaps, higher_fmaps, lower_fmaps]
+            with torch.no_grad():
+                if self.use_dino == 3:
+                    dino_maps = self.dino_net(rearrange(video, "b t c h w -> (b t) c h w"))
+                elif self.use_dino == 4: # chrono track
+                    img_mult = self.dino_size // 14
+                    dino_maps = self.dino_net.forward_dino(video, img_mult=img_mult)
+                    dino_maps = rearrange(dino_maps, "b t c h w -> (b t) c h w")
+                    # print(dino_maps.shape)
+                for i, m in enumerate(ret):
+                    mH, mW = m.shape[3:]
+                    dino_maps_ = torch.nn.functional.interpolate(
+                        dino_maps,
+                        size=(mH, mW),
+                        mode='bicubic',
+                        align_corners=True,
+                    )
+                    dino_maps_ = rearrange(dino_maps_, "(b t) c h w -> b t c h w", b=B, t=T)
+                    ret[i] = torch.cat([ret[i], dino_maps_], dim=2)
 
+            fmaps, higher_fmaps, lower_fmaps = ret
         return fmaps, higher_fmaps, lower_fmaps
 
     def prepare_sparse_queries(
@@ -749,7 +806,6 @@ class DenseTrack3DV2(nn.Module):
         # NOTE normalize queries
         sparse_queried_coords = sparse_queries[..., 1:4].clone()
         sparse_queried_coords[..., :2] = sparse_queried_coords[..., :2] / self.stride
-
         # We compute track features # FIXME only get 2d coord
         track_feat, supp_track_feats_pyramid = self.get_track_feat(
             fmaps,
@@ -786,6 +842,7 @@ class DenseTrack3DV2(nn.Module):
         fmaps_pyramid: tuple[VideoType, ...],
         depth_init_downsample: Float[Tensor, "b 1 h w"],
         is_train: bool = False,
+        x0_y0_dW_dH = None
     ) -> tuple:
     
         S = self.window_len
@@ -803,9 +860,15 @@ class DenseTrack3DV2(nn.Module):
             y0 = np.random.randint(0, fH * self.stride / self.upsample_factor - dH, size=B)
             x0 = np.random.randint(0, fW * self.stride / self.upsample_factor - dW, size=B)
         else:
-            # dH, dW = self.model_resolution[0] // (self.stride), self.model_resolution[1] // (self.stride)
-            dH, dW = self.input_reso[0] // (self.upsample_factor), self.input_reso[1] // (self.upsample_factor)
-            x0, y0 = [0] * B, [0] * B
+            if x0_y0_dW_dH is None:
+                # dH, dW = self.model_resolution[0] // (self.stride), self.model_resolution[1] // (self.stride)
+                dH, dW = self.input_reso[0] // (self.upsample_factor), self.input_reso[1] // (self.upsample_factor)
+                x0, y0 = [0] * B, [0] * B
+            else:
+                x0, y0, dW, dH = x0_y0_dW_dH
+                dH, dW = dH // (self.upsample_factor), dW // (self.upsample_factor)
+                x0, y0 = [x0 // self.upsample_factor] * B, [y0 // self.upsample_factor] * B
+
         self.dH, self.dW = dH, dW
 
         cropped_depths = torch.stack(
@@ -877,6 +940,7 @@ class DenseTrack3DV2(nn.Module):
         use_dense: bool = True,
         use_efficient_global_attn: bool = False,
         accelerator = None,
+        x0_y0_dW_dH = None,
     ) -> tuple[dict | None, dict | None, tuple[dict | None, dict | None] | None]:
         """Predict tracks
 
@@ -929,6 +993,7 @@ class DenseTrack3DV2(nn.Module):
                 fmaps, higher_fmaps, lower_fmaps = self.extract_features(video)
         else:
             fmaps, higher_fmaps, lower_fmaps = self.extract_features(video)
+        
         fmaps_pyramid = [higher_fmaps, fmaps, lower_fmaps]
         fH, fW = fmaps.shape[-2:]
 
@@ -989,6 +1054,7 @@ class DenseTrack3DV2(nn.Module):
                     fmaps_pyramid,
                     depth_init_downsample,
                     is_train,
+                    x0_y0_dW_dH,
                 )
             )
 

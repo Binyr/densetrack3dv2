@@ -31,6 +31,7 @@ class EvaluationPredictor(torch.nn.Module):
         local_grid_size: int = 8,
         single_point: bool = True,
         n_iters: int = 6,
+        num_patch = None,
     ) -> None:
         super(EvaluationPredictor, self).__init__()
 
@@ -41,6 +42,8 @@ class EvaluationPredictor(torch.nn.Module):
         self.single_point = single_point
         self.interp_shape = interp_shape
         self.n_iters = n_iters
+        # 
+        self.num_patch = num_patch
 
         self.model = model
         self.model.eval()
@@ -88,7 +91,7 @@ class EvaluationPredictor(torch.nn.Module):
                 lift_3d=lift_3d
             )
 
-    def forward_flow2d(self, video, videodepth, dst_frame=-1, gt_flow=None):
+    def forward_flow2d(self, video, videodepth, dst_frame=-1, gt_flow=None, vis=False):
         B, T, C, H, W = video.shape
         # device = video.device
 
@@ -101,25 +104,62 @@ class EvaluationPredictor(torch.nn.Module):
                 B, T, 1, self.interp_shape[0], self.interp_shape[1]
             )
 
-        sparse_predictions, dense_predictions, _ = self.model(
-            video=video,
-            videodepth=videodepth,
-            sparse_queries=None,
-            iters=self.n_iters,
-            # gt_flow=gt_flow,
-        )
+        if self.num_patch is None:
+            sparse_predictions, dense_predictions, _ = self.model(
+                video=video,
+                videodepth=videodepth,
+                sparse_queries=None,
+                iters=self.n_iters,
+                # gt_flow=gt_flow,
+            )
 
-        dense_traj_e, dense_vis_e = (
-            dense_predictions["coords"],
-            dense_predictions["vis"],
-        )
+            dense_traj_e, dense_vis_e = (
+                dense_predictions["coords"], # B T 2 H W
+                dense_predictions["vis"], # B T H W
+            )
+            
+        else:
+            num_patch = self.num_patch
+            iH, iW = self.interp_shape
+            
+            # NOTE add regular grid queries:
+            grid_xy = get_points_on_a_grid((12, 16), video.shape[3:]).long().float()
+            grid_xy = torch.cat([torch.zeros_like(grid_xy[:, :, :1]), grid_xy], dim=2).to(video.device)  # B, N, C
+            grid_xy_d = bilinear_sampler(videodepth[:, 0], rearrange(grid_xy[..., 1:3], "b n c -> b () n c"), mode="nearest")
+            grid_xy_d = rearrange(grid_xy_d, "b c m n -> b (m n) c")
+
+            grid_queries = torch.cat([grid_xy, grid_xy_d], dim=-1)
+            
+            # prepare x0, y0, dH, dW
+            dense_traj_e = torch.zeros((B, T, 2, *self.interp_shape), dtype=video.dtype, device=video.device)
+            dense_vis_e = torch.zeros((B, T, *self.interp_shape), dtype=video.dtype, device=video.device)
+            patch_h, patch_w = iH // num_patch, iW // num_patch
+            for i in range(num_patch): # x
+                for j in range(num_patch): # y
+                    x0, y0 = i * patch_w, j * patch_h
+                    patch = [x0, y0, patch_w, patch_h]
+                    sparse_predictions, dense_predictions, _ = self.model(
+                        video=video,
+                        videodepth=videodepth,
+                        sparse_queries=grid_queries,
+                        iters=self.n_iters,
+                        # gt_flow=gt_flow,
+                        x0_y0_dW_dH = patch
+                    )
+                    dense_traj_e_, dense_vis_e_ = (
+                        dense_predictions["coords"],
+                        dense_predictions["vis"],
+                    )
+                    dense_traj_e[:, :, :, y0:y0+patch_h, x0:x0+patch_w] = dense_traj_e_
+                    dense_vis_e[:, :, y0:y0+patch_h, x0:x0+patch_w] = dense_vis_e_
+            
+
+
         flow_to_last = dense_traj_e[:, dst_frame, :2] - self.ori_grid
-        flow_alpha = dense_vis_e[:, dst_frame]  # B 2 H W
+        flow_alpha = dense_vis_e[:, dst_frame]  # B T H W
 
         # flow_to_last = torch.zeros_like(self.ori_grid)
         # flow_alpha = torch.ones_like(self.ori_grid[:, 0])
-
-        
 
         # TODO find a better way to handle this instead of interpolate
         if self.interp_shape[0] != H or self.interp_shape[1] != W:
@@ -133,7 +173,24 @@ class EvaluationPredictor(torch.nn.Module):
         flow_alpha = rearrange(flow_alpha, "b 1 h w -> b h w")
         flow_alpha = (flow_alpha > 0.9).float()
 
-        return flow_to_last, flow_alpha
+        dense_traj_e_vis, dense_vis_e_vis = None, None
+        if vis:
+            if self.interp_shape[0] != H or self.interp_shape[1] != W:
+                dense_traj_e_vis = dense_traj_e[:, :, :2] # B,T,2,H,W
+                T = dense_traj_e_vis.shape[1]
+                dense_traj_e_vis = rearrange(dense_traj_e_vis, "b t c h w -> (b t) c h w")
+                dense_traj_e_vis = F.interpolate(dense_traj_e_vis, size=(H, W), mode="bilinear")
+                dense_traj_e_vis[:, 0] = dense_traj_e_vis[:, 0] * (W - 1) / float(self.interp_shape[1] - 1)
+                dense_traj_e_vis[:, 1] = dense_traj_e_vis[:, 1] * (H - 1) / float(self.interp_shape[0] - 1)
+                dense_traj_e_vis = rearrange(dense_traj_e_vis, "(b t) c h w -> b t h w c", t=T)
+
+                dense_vis_e_vis = dense_vis_e # B,T,H,W
+                dense_vis_e_vis = rearrange(dense_vis_e_vis, "b t h w -> (b t) h w")
+                dense_vis_e_vis = F.interpolate(dense_vis_e_vis.unsqueeze(1), size=(H, W), mode="bilinear")
+                dense_vis_e_vis = rearrange(dense_vis_e_vis, "(b t) 1 h w -> b t h w", t=T)
+
+        return flow_to_last, flow_alpha, dense_traj_e_vis, dense_vis_e_vis
+
 
     def forward_flow2d_down(self, video, videodepth, dst_frame=-1):
         B, T, C, H, W = video.shape
