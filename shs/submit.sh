@@ -1,0 +1,15 @@
+rjob submit \
+    --name=deltav2-dinov3-vitl16-512 \
+    --gpu=4 \
+    --memory=800000 \
+    --cpu=64 \
+    --charged-group=idc2_gpu \
+    --private-machine=group \
+    --mount=gpfs://gpfs1/binyanrui:/mnt/shared-storage-user/binyanrui \
+    --mount=gpfs://gpfs1/idc2-shared:/mnt/shared-storage-user/idc2-shared \
+    --mount=gpfs://gpfs1/si-data:/mnt/shared-storage-user/si-data \
+    --image=registry.h.pjlab.org.cn/ailab-idc2-idc2_gpu/binyanrui:20250902180512 \
+    --custom-resources=brainpp.cn/fuse=1 \
+    -P 1 \
+    -e DISTRIBUTED_JOB=true \
+-- bash -exc /mnt/shared-storage-user/binyanrui/Projects/datasets/DenseTrack3Dv2/shs/train_v2_3d_dinov3_vitl16_512.sh
