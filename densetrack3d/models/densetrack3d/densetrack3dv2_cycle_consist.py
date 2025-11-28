@@ -78,6 +78,7 @@ class DenseTrack3DV2(nn.Module):
         stride_supp="1",
         radius_corr="3",
         stride_corr="1",
+        cycle_loss=False
     ):
         super().__init__()
         self.window_len = window_len
@@ -99,6 +100,9 @@ class DenseTrack3DV2(nn.Module):
             output_dim=self.latent_dim,
             stride=self.stride,
         )
+        # cycle loss
+        self.cycle_loss = cycle_loss
+
         ###############
         # define dino #
         ###############
@@ -1314,6 +1318,9 @@ class DenseTrack3DV2(nn.Module):
         use_efficient_global_attn: bool = False,
         accelerator = None,
         x0_y0_dW_dH = None,
+        grid_queries = None,
+        grid_queries_last = None,
+        depth_init_last = None,
     ) -> tuple[dict | None, dict | None, tuple[dict | None, dict | None] | None]:
         """Predict tracks
 
@@ -1367,6 +1374,82 @@ class DenseTrack3DV2(nn.Module):
         else:
             fmaps, higher_fmaps, lower_fmaps, dino_fmaps = self.extract_features(video)
         
+        n_sparse = sparse_queries.shape[1]
+        sparse_queries = torch.cat([sparse_queries, grid_queries], dim=1)
+        sparse_predictions, dense_predictions, train_data = self.forward_tracking_head(
+            video,
+            videodepth,
+            sparse_queries,
+            depth_init,
+            iters,
+            is_train,
+            use_dense,
+            use_efficient_global_attn,
+            accelerator,
+            x0_y0_dW_dH,
+            higher_fmaps,
+            fmaps,
+            lower_fmaps,
+            dino_fmaps,
+        )
+
+        if self.cycle_loss:
+            # prepare cycle
+            # sparse_queries: 1, 320, 4 (t u v d)
+            
+            sparse_predictions_uv = sparse_predictions["coords"] # 1, 24, 320, 2
+            sparse_predictions_d = sparse_predictions["coord_depths"] # 1, 24, 320, 1
+            
+            sparse_queries_inverse = torch.cat([torch.zeros_like(sparse_predictions_d[:, -1, :n_sparse]), sparse_predictions_uv[:, -1, :n_sparse], sparse_predictions_d[:, -1, :n_sparse]], dim=2)
+            
+            sparse_queries_inverse = torch.cat([sparse_queries_inverse, grid_queries_last], dim=1)
+            # import pdb
+            # pdb.set_trace()
+            sparse_predictions_inverse, dense_predictions_inverse, train_data_inverse = self.forward_tracking_head(
+                video.flip(1),
+                videodepth.clip(1),
+                sparse_queries_inverse,
+                depth_init_last,
+                iters,
+                is_train,
+                False, # use_dense,
+                use_efficient_global_attn,
+                accelerator,
+                x0_y0_dW_dH,
+                higher_fmaps.flip(1),
+                fmaps.flip(1),
+                lower_fmaps.flip(1),
+                dino_fmaps.flip(1),
+            )
+            return sparse_predictions, dense_predictions, train_data, sparse_predictions_inverse, dense_predictions_inverse, train_data_inverse
+        else:
+            return sparse_predictions, dense_predictions, train_data, None, None, None
+    
+    def forward_tracking_head(
+        self,
+        video: VideoType,
+        videodepth: Float[Tensor, "b t 1 h w"],
+        sparse_queries: Float[Tensor, "b n c"] = None,
+        depth_init: Float[Tensor, "b 1 h w"] = None,
+        iters: int = 4,
+        is_train: bool = False,
+        use_dense: bool = True,
+        use_efficient_global_attn: bool = False,
+        accelerator = None,
+        x0_y0_dW_dH = None,
+        higher_fmaps = None,
+        fmaps = None,
+        lower_fmaps = None,
+        dino_fmaps = None,
+    ) -> tuple[dict | None, dict | None, tuple[dict | None, dict | None] | None]:
+        B, T, C, H, W = video.shape
+        S = self.window_len
+        device = video.device
+        step = S // 2
+        use_sparse = self.use_sparse
+        ori_T = self.ori_T
+        Dz = self.Dz
+
         # print(dino_fmaps.shape)
         fmaps_pyramid = [higher_fmaps, fmaps, lower_fmaps]
         fH, fW = fmaps.shape[-2:]

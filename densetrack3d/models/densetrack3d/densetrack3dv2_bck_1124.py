@@ -70,7 +70,6 @@ class DenseTrack3DV2(nn.Module):
         freeze_dino=False,
         use_deconv1=False,
         use_deconv2=False,
-        use_anyup=False,
         use_merge_conv=False,
         merge_dino_method="cat",
         merge_dino_corr_method="mask", # mask, extra
@@ -113,11 +112,7 @@ class DenseTrack3DV2(nn.Module):
         self.merge_dino_corr_method = merge_dino_corr_method
 
         if self.use_dino in ["dinov2_vitl14", "dinov3_vitl16", "dinov2_vitb14", "dinov3_vitb16"]:
-            self.dino_net = DINO_Encoder(
-                model_name=use_dino, patch_size=dino_size, 
-                use_deconv1=use_deconv1, use_deconv2=use_deconv2,
-                use_anyup=use_anyup,
-            )
+            self.dino_net = DINO_Encoder(model_name=use_dino, patch_size=dino_size, use_deconv1=use_deconv1, use_deconv2=use_deconv2)
             
         elif self.use_dino == "chrono":
             model_kwargs = {"dino_size": "base", "dino_reg": False, "adapter_intermed_channels": 128}
@@ -179,14 +174,16 @@ class DenseTrack3DV2(nn.Module):
                 
                 self.input_dim = 1032
                 if self.merge_dino_corr_method == "extra":
-                    # cmdtop_params = {
-                    #     "in_channel": 64,
-                    #     "out_channels": (64, 128, 128),
-                    #     "kernel_shapes": (3, 3, 2),
-                    #     "strides": (2, 2, 2),
-                    # }
-                    # self.cmdtop_dino = Corr4DCNN(**cmdtop_params)
+                    cmdtop_params = {
+                        "in_channel": 64,
+                        "out_channels": (64, 128, 128),
+                        "kernel_shapes": (3, 3, 2),
+                        "strides": (2, 2, 2),
+                    }
+                    self.cmdtop_dino = Corr4DCNN(**cmdtop_params)
                     self.input_dim = 1032 + 256
+            
+            elif self.merge_dino_method == "extra_corr":
                 
             else:
                 self.input_dim = 1032 + dino_c_dim
@@ -217,7 +214,7 @@ class DenseTrack3DV2(nn.Module):
         time_grid = torch.linspace(0, window_len - 1, window_len).reshape(1, window_len, 1)
 
         self.register_buffer("time_emb", get_1d_sincos_pos_embed_from_grid(self.input_dim, time_grid[0]))
-        
+
         self.register_buffer(
             "pos_emb",
             get_2d_sincos_pos_embed(
@@ -276,7 +273,7 @@ class DenseTrack3DV2(nn.Module):
             x = eval(x)
             if isinstance(x, int):
                 x = [x] * 3
-            assert isinstance(x, list)
+            assert isinstance(x, list) and len(x) == 3
             return x
         self.radius_supps = init_radius_or_stride(radius_supp)
         self.stride_supps = init_radius_or_stride(stride_supp)
@@ -311,7 +308,7 @@ class DenseTrack3DV2(nn.Module):
             "strides": (2, 2, 2),
         }
         l = []
-        for i in range(len(delta_corrs)):
+        for i in range(3):
             diameter1 = int(2 * self.radius_corrs[i] / self.stride_corrs[i] + 1)
             diameter2 = int(2 * self.radius_supps[i] / self.stride_supps[i] + 1)
             if diameter1 == 7 and diameter2 == 7:
@@ -518,14 +515,7 @@ class DenseTrack3DV2(nn.Module):
         for lvl, supp_track_feat_ in enumerate(supp_track_feat):
             diameter = int(2 * self.radius_corrs[lvl] / self.stride_corrs[lvl] + 1)
 
-            if lvl < 3:
-                centroid_lvl = coords.reshape(B * S, N, 1, 1, 2) / 2 ** (lvl - 1)
-            else:
-                _, _, _, dinoH, dinoW = fmaps_pyramid[lvl].shape
-                fH, fW = [x // self.stride for x in self.model_resolution]
-                assert fH / dinoH == fW / dinoW
-                centroid_lvl = coords.reshape(B * S, N, 1, 1, 2) / fH * dinoH
-
+            centroid_lvl = coords.reshape(B * S, N, 1, 1, 2) / 2 ** (lvl - 1)
             coords_lvl = centroid_lvl + self.delta_corrs[lvl][None, None].to(centroid_lvl.device)  # (B S) N (2r+1) (2r+1) 2
 
             _, _, C_, H_, W_ = fmaps_pyramid[lvl].shape
@@ -599,40 +589,18 @@ class DenseTrack3DV2(nn.Module):
                 sample_coords,
             )
             supp_track_feats = supp_track_feats.view(B, N, diameter, diameter, -1)
+            # dino
+            # supp_track_dinos will be used later. As a attn or an extra corr
+            if self.merge_dino_method in ["corr", "corr_track_feat"] and lvl == 1: # main feature
+                supp_track_dinos = sample_features5d(
+                    dino_fmaps,
+                    sample_coords,
+                )
+                supp_track_dinos = supp_track_dinos.view(B, N, diameter, diameter, -1)
+                supp_track_feats = torch.cat([supp_track_feats, supp_track_dinos], dim=-1)
 
             supp_track_feats_pyramid.append(supp_track_feats)
-        
-        # dino
-        # supp_track_dinos will be used later. As a attn or an extra corr
-        if self.merge_dino_method in ["corr", "corr_track_feat"]: # main feature
-            _, _, _, dinoH, dinoW = dino_fmaps.shape
-            fH, fW = [x // self.stride for x in self.model_resolution]
-            assert fH / dinoH == fW / dinoW
 
-            diameter = int(2 * self.radius_supps[num_levels] / self.stride_supps[num_levels] + 1)
-
-            centroid_lvl = queried_coords.reshape(B * N, 1, 1, 2) / fH * dinoH
-            coords_lvl = centroid_lvl + self.delta_supps[num_levels][None].to(centroid_lvl.device)
-            coords_lvl = coords_lvl.reshape(B, 1, N * diameter * diameter, 2)
-
-            sample_frames = queried_frames[:, None, :, None, None, None].expand(
-                B, 1, N, diameter, diameter, 1
-            )
-            sample_frames = sample_frames.reshape(B, 1, N * diameter * diameter, 1)
-            sample_coords = torch.cat(
-                [
-                    sample_frames,
-                    coords_lvl,
-                ],
-                dim=-1,
-            )  # B 1 N 3
-
-            supp_track_feats_dino = sample_features5d(
-                dino_fmaps,
-                sample_coords,
-            )
-            supp_track_feats_dino = supp_track_feats_dino.view(B, N, diameter, diameter, -1)
-            supp_track_feats_pyramid.append(supp_track_feats_dino)
 
         return sample_track_feats, supp_track_feats_pyramid
 
@@ -668,27 +636,19 @@ class DenseTrack3DV2(nn.Module):
             supp_track_feats = rearrange(
                 supp_track_feats, "b (n r1 r2) c -> b n r1 r2 c", n=N, r1=diameter, r2=diameter
             )
+            # dino
+            # supp_track_dinos will be used later. As a attn or an extra corr
+            if self.merge_dino_method in ["corr", "corr_track_feat"] and lvl == 1: # main feature
+                supp_track_dinos = sample_features4d(
+                    dino_fmaps[:, 0],
+                    coords_lvl,
+                )
+                supp_track_dinos = rearrange(
+                    supp_track_dinos, "b (n r1 r2) c -> b n r1 r2 c", n=N, r1=diameter, r2=diameter
+                )
+                supp_track_feats = torch.cat([supp_track_feats, supp_track_dinos], dim=-1)
+
             supp_track_feats_pyramid.append(supp_track_feats)
-        
-        # dino
-        # supp_track_dinos will be used later. As a attn or an extra corr
-        if self.merge_dino_method in ["corr", "corr_track_feat"]: # main feature
-            _, _, _, dinoH, dinoW = dino_fmaps.shape
-            fH, fW = [x // self.stride for x in self.model_resolution]
-            assert fH / dinoH == fW / dinoW
-
-            diameter = int(2 * self.radius_supps[num_levels] / self.stride_supps[num_levels] + 1)
-
-            centroid_lvl = rearrange(dense_coords, "b n c -> (b n) () () c") / fH * dinoH
-            coords_lvl = centroid_lvl + self.delta_supps[num_levels][None].to(centroid_lvl.device)
-            coords_lvl = rearrange(coords_lvl, "(b n) r1 r2 c -> b (n r1 r2) c", b=B, n=N)
-
-            supp_track_feats_dino = sample_features4d(dino_fmaps[:, 0], coords_lvl)
-
-            supp_track_feats_dino = rearrange(
-                supp_track_feats_dino, "b (n r1 r2) c -> b n r1 r2 c", n=N, r1=diameter, r2=diameter
-            )
-            supp_track_feats_pyramid.append(supp_track_feats_dino)
 
         return sample_track_feats, supp_track_feats_pyramid
 
@@ -716,7 +676,7 @@ class DenseTrack3DV2(nn.Module):
             with torch.no_grad():
                 fcorrs = self.get_4dcorr_features(fmaps_pyramid, coords, supp_track_feat)
         else:
-            if False and self.merge_dino_method in ["corr", "corr_track_feat"]:
+            if self.merge_dino_method in ["corr", "corr_track_feat"]:
                 dino_maps = fmaps_pyramid[-1]
                 fmaps_pyramid_ = fmaps_pyramid[:-1]
 
@@ -741,34 +701,21 @@ class DenseTrack3DV2(nn.Module):
         
         # for x in ["flows_2d_emb", "flows_2d", "flows_3d", "fcorrs", "dcorrs", "track_feat", "track_mask_vis"]:
         #     print(f"{x}", eval(x).shape)
-        
-        if fcorrs.shape[-1] > 768:
-            transformer_input = torch.cat(
-                [
-                    flows_2d_emb,
-                    flows_2d,
-                    flows_3d,
-                    fcorrs[..., :768],
-                    dcorrs,
-                    track_feat,
-                    track_mask_vis,
-                    fcorrs[..., 768:],
-                ],
-                dim=-1,
-            )
-        else:
-            transformer_input = torch.cat(
-                [
-                    flows_2d_emb,
-                    flows_2d,
-                    flows_3d,
-                    fcorrs,
-                    dcorrs,
-                    track_feat,
-                    track_mask_vis,
-                ],
-                dim=-1,
-            )
+        # import pdb
+        # pdb.set_trace()
+
+        transformer_input = torch.cat(
+            [
+                flows_2d_emb,
+                flows_2d,
+                flows_3d,
+                fcorrs,
+                dcorrs,
+                track_feat,
+                track_mask_vis,
+            ],
+            dim=-1,
+        )
 
         pos_emb = sample_features4d(self.pos_emb.repeat(B, 1, 1, 1), coords[:, 0])
         
@@ -1098,6 +1045,7 @@ class DenseTrack3DV2(nn.Module):
                 dino_maps = rearrange(dino_maps, "b t c h w -> (b t) c h w")
             else:
                 raise
+            
             if self.merge_dino_method in ["merge_conv", "cat"]:
                 ret = [fmaps, higher_fmaps, lower_fmaps]
                 for i, m in enumerate(ret):
@@ -1139,13 +1087,13 @@ class DenseTrack3DV2(nn.Module):
                 lower_fmaps = lower_fmaps + dino_maps_
                 
             elif self.merge_dino_method in ["corr", "track_feat", "corr_track_feat"]:
-                # mH, mW = fmaps.shape[3:]
-                # dino_maps = torch.nn.functional.interpolate(
-                #         dino_maps,
-                #         size=(mH, mW),
-                #         mode='bicubic',
-                #         align_corners=True,
-                #     )
+                mH, mW = fmaps.shape[3:]
+                dino_maps = torch.nn.functional.interpolate(
+                        dino_maps,
+                        size=(mH, mW),
+                        mode='bicubic',
+                        align_corners=True,
+                    )
                 dino_maps = rearrange(dino_maps, "(b t) c h w -> b t c h w", b=B, t=T)
                 return fmaps, higher_fmaps, lower_fmaps, dino_maps
 
@@ -1290,11 +1238,6 @@ class DenseTrack3DV2(nn.Module):
         vis_init = smart_cat(vis_init, dense_vis_init, dim=2)  # torch.cat([vis_init, dense_vis_init], dim=2)
         conf_init = smart_cat(conf_init, dense_conf_init, dim=2)  # torch.cat([vis_init, dense_vis_init], dim=2)
         track_feat = smart_cat(track_feat, dense_track_feat, dim=2)  # torch.cat([track_feat, dense_track_feat], dim=2)
-        
-        # fix bug when use sparse=False
-        if self.merge_dino_method == "corr" and len(supp_track_feats_pyramid) == 3:
-            supp_track_feats_pyramid.append(supp_track_feats_pyramid[-1])
-
         supp_track_feats_pyramid = [
             smart_cat(sf, dense_sf, dim=1)
             for sf, dense_sf in zip(supp_track_feats_pyramid, dense_supp_track_feats_pyramid)
@@ -1367,7 +1310,6 @@ class DenseTrack3DV2(nn.Module):
         else:
             fmaps, higher_fmaps, lower_fmaps, dino_fmaps = self.extract_features(video)
         
-        # print(dino_fmaps.shape)
         fmaps_pyramid = [higher_fmaps, fmaps, lower_fmaps]
         fH, fW = fmaps.shape[-2:]
 
@@ -1405,8 +1347,6 @@ class DenseTrack3DV2(nn.Module):
             
             # We store our predictions here
             coords_predicted = torch.zeros((B, ori_T, self.N_sparse, 2), device=device)
-            if not is_train:
-                coords_predicted_lis = [coords_predicted.clone() for _ in range(iters-1)]
             coords_depths_predicted = torch.zeros((B, ori_T, self.N_sparse, 1), device=device)
             vis_predicted = torch.zeros((B, ori_T, self.N_sparse), device=device)
             conf_predicted = torch.zeros((B, ori_T, self.N_sparse), device=device)
@@ -1594,10 +1534,6 @@ class DenseTrack3DV2(nn.Module):
                 vis_predicted[:, ind : ind + S] = vis[:, :S_trimmed, : self.N_sparse]
                 conf_predicted[:, ind : ind + S] = conf[:, :S_trimmed, : self.N_sparse]
 
-                if not is_train:
-                    for iti in range(iters - 1):
-                        coords_predicted_lis[iti][:, ind : ind + S] = coords[iti][:, :S_trimmed, : self.N_sparse] * self.stride
-
                 # if is_train:
                 #     all_coords_predictions.append(
                 #         [(coord[:, :S_trimmed, : self.N_sparse] * self.stride) for coord in coords]
@@ -1744,7 +1680,7 @@ class DenseTrack3DV2(nn.Module):
             )
 
         if not is_train:
-            return sparse_predictions, dense_predictions, coords_predicted_lis
+            return sparse_predictions, dense_predictions, None
 
         sparse_train_data_dict, dense_train_data_dict = None, None
         if use_sparse:

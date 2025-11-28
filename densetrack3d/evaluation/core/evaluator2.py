@@ -640,7 +640,7 @@ class Evaluator:
                 if not all(gotit):
                     print("batch is None")
                     continue
-
+            
             dataclass_to_cuda_(sample)
 
             with CUDATimer("Forward"):
@@ -659,8 +659,18 @@ class Evaluator:
                 n_queries = queries.shape[1]
 
                 intrs = sample.intrs
+                # binyanrui, fetch only first window
+                first_window = False
+                if first_window:
+                    S = 16
+                    # intrs = intrs[:, :S]
+                # binyanrui, infer only 85th query
+                if False:
+                    queries = queries[:, 85:86]
+                    sample.trajectory = sample.trajectory[:, :, 85:86]
+                    n_queries = 1
 
-                traj_e, traj_d_e, vis_e = model(
+                traj_e, traj_d_e, vis_e, traj_e_lis = model(
                     video=sample.video,
                     videodepth=sample.videodepth,
                     queries=queries,
@@ -675,6 +685,9 @@ class Evaluator:
                 traj_d_e = traj_d_e[:, :, :n_queries]
                 vis_e = vis_e[:, :, :n_queries]
 
+                for iti, x in enumerate(traj_e_lis):
+                    traj_e_lis[iti] = x[:, :, :n_queries]
+
                 if "tapvid3d" in dataset_name:
                     # NOTE tracking backward
                     inv_video = sample.video.flip(1).clone()
@@ -682,7 +695,7 @@ class Evaluator:
                     inv_queries = queries.clone()
                     inv_queries[:, :, 0] = inv_video.shape[1] - inv_queries[:, :, 0] - 1
 
-                    inv_traj_e, inv_traj_d_e, inv_vis_e = model(
+                    inv_traj_e, inv_traj_d_e, inv_vis_e, inv_traj_e_lis = model(
                         video=inv_video,
                         videodepth=inv_videodepth,
                         queries=inv_queries,
@@ -695,13 +708,18 @@ class Evaluator:
                     inv_traj_e = inv_traj_e[:, :, :n_queries].flip(1)
                     inv_traj_d_e = inv_traj_d_e[:, :, :n_queries].flip(1)
                     inv_vis_e = inv_vis_e[:, :, :n_queries].flip(1)
-
+                    for iti, x in enumerate(inv_traj_e_lis):
+                        inv_traj_e_lis[iti] = x[:, :, :n_queries].flip(1)
+                    
                     arange = torch.arange(sample.video.shape[1], device=queries.device)[None, :, None]
                     mask = (arange < queries[:, None, :, 0]).unsqueeze(-1).repeat(1, 1, 1, inv_traj_e.shape[-1])
 
                     traj_e[mask] = inv_traj_e[mask]
                     traj_d_e[mask[:, :, :, 0]] = inv_traj_d_e[mask[:, :, :, 0]]
                     vis_e[mask[:, :, :, 0]] = inv_vis_e[mask[:, :, :, 0]]
+
+                    for iti in range(len(inv_traj_e_lis)):
+                        traj_e_lis[iti][mask] = inv_traj_e_lis[iti][mask]
 
                 traj_uvd = torch.cat([traj_e, traj_d_e], dim=-1)
                 traj_3d = reproject_2d3d(traj_uvd, intrs)
@@ -714,29 +732,29 @@ class Evaluator:
             if is_vis:
                 trajs_g = sample.trajectory # B,T,N,2
                 trajs_e = traj_e
-                if False:
-                    value, index_ = torch.linalg.norm(trajs_g - trajs_e, dim=3).mean(dim=1).sort(dim=1)
-                    for iii in range(1, 11):
-                        index = index_[:, -iii-1:-iii]
-                        trajs_g_ = trajs_g[:, :, index[0]]
-                        trajs_e_ = trajs_e[:, :, index[0]]
-                        queries_ = queries[:, index[0]]
-                        print(torch.linalg.norm(trajs_g - trajs_e, dim=3)[:, :, index[0]].squeeze().cpu().numpy().round(3))
-                        print(queries_.squeeze())
-                        vis.visualize(
-                            video=sample.video,
-                            tracks=trajs_e_,
-                            gt_tracks=trajs_g_,
-                            filename=f"{sample.seq_name[0]}_{iii}",
-                            queries=queries_,
-                        )
-                    raise
-                else:
-                    value, index_ = torch.linalg.norm(trajs_g - trajs_e, dim=3).mean(dim=1).sort(dim=1)
-                    index = index_[:, -10:]
-                    print(index)
+                trajs_e_lis = traj_e_lis
+                
+                value, index_ = torch.linalg.norm(trajs_g - trajs_e, dim=3).mean(dim=1).sort(dim=1)
+                # import pdb
+                # pdb.set_trace()
+                for iii in range(0, 10):
+                    if n_queries == 1:
+                        index = index_
+                    else:
+                        if iii == 0:
+                            index = index_[:, -iii-1:]
+                        else:
+                            index = index_[:, -iii-1:-iii]
+
+                    # index = index_[:, -10:]
                     trajs_g_ = trajs_g[:, :, index[0]]
+
+                    tmp = []
+                    for x in traj_e_lis:
+                        tmp.append(x[:, :, index[0]])
                     trajs_e_ = trajs_e[:, :, index[0]]
+                    trajs_e_ = torch.cat([*tmp, trajs_e_], dim=2)
+
                     queries_ = queries[:, index[0]]
                     print(torch.linalg.norm(trajs_g - trajs_e, dim=3)[:, :, index[0]].squeeze().cpu().numpy().round(3))
                     print(queries_.squeeze())
@@ -744,9 +762,12 @@ class Evaluator:
                         video=sample.video,
                         tracks=trajs_e_,
                         gt_tracks=trajs_g_,
-                        filename=f"{sample.seq_name[0]}",
+                        filename=f"{sample.seq_name[0]}_{iii}",
                         queries=queries_,
                     )
+                raise
+
+
 
         
         return metrics

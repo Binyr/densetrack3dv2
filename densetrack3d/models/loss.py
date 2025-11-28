@@ -12,8 +12,73 @@ from einops import rearrange, repeat
 from jaxtyping import Float, Int64
 from torch import Tensor, nn
 
+from densetrack3d.models.geometry_utils import reproject_2d3d
 
 EPS = 1e-6
+
+
+def rigid_instane_loss(traj_inst_ids, gt_uvd, pred_uvd, intrinsics, weight_offset=0.8, num_sampled_traj=256, use_var=False, use_d_weight=False):
+    """
+    inst_id: B,N
+    gt_uvd: B,T,N,3
+    pred_uvd: B,I,T,N,3
+    intrinsic: B,T,3,3
+    """
+    B,I,T,N = pred_uvd.shape[:4]
+
+    if num_sampled_traj is not None:
+        sample_index = torch.randperm(N)[:num_sampled_traj]
+        traj_inst_ids = traj_inst_ids[:, sample_index]
+        gt_uvd = gt_uvd[:, :, sample_index]
+        pred_uvd = pred_uvd[:, :, :, sample_index]
+    # print(pred_uvd.shape)
+    B,I,T,N = pred_uvd.shape[:4]
+    # 1. reproject 2d to 3D
+    gt_3d = reproject_2d3d(gt_uvd, intrinsics) # B, T, N, 3
+
+    pred_uvd = rearrange(pred_uvd, "b i t n c -> (b i) t n c")
+    _intrinsics = intrinsics.repeat(I, 1, 1, 1)
+    pred_3d = reproject_2d3d(pred_uvd, _intrinsics) # (B I), T, N, 3
+    pred_3d = rearrange(pred_3d, "(b i) t n c -> b i t n c", i=I)
+
+    # 2. inst loss
+    loss = 0
+    for i in range(B):
+        inst_id_set = torch.unique(traj_inst_ids[i])
+        for _id in inst_id_set:
+            gt_3d_inst = gt_3d[i, :, traj_inst_ids[i]==_id] # T, n, 3
+            avg_depth_inst = gt_3d_inst[:, :, 2].mean()
+            if avg_depth_inst < 0.1:
+                avg_depth_inst = 0.1
+
+            if gt_3d_inst.shape[1] < 4:
+                continue
+
+            gt_3d_inst_1 = gt_3d_inst.unsqueeze(2) # T, n, 1, 3
+            gt_3d_inst_2 = gt_3d_inst.unsqueeze(1) # T, 1, n, 3
+            gt_dist_matrix =  torch.linalg.norm(gt_3d_inst_1 - gt_3d_inst_2, dim=3) # T, n, n
+
+            pred_3d_inst = pred_3d[i, :, :, traj_inst_ids[i]==_id]
+            pred_3d_inst_1 = pred_3d_inst.unsqueeze(3) # I, T, n, 1, 3
+            pred_3d_inst_2 = pred_3d_inst.unsqueeze(2) # I, T, 1, n, 3
+            pred_dist_matrix =  torch.linalg.norm(pred_3d_inst_1 - pred_3d_inst_2, dim=4) # I, T, n, n
+
+            _, n, _ = gt_dist_matrix.shape
+            _loss = 0
+            for j in range(I):
+                i_weight = weight_offset ** (I - j - 1)
+                if not use_var:
+                    _loss += i_weight * (pred_dist_matrix[j] - gt_dist_matrix).abs().sum() / (T * n * (n - 1))
+                else:
+                    _loss += i_weight * (pred_dist_matrix[j] - pred_dist_matrix[j].mean(dim=0, keepdim=True)).abs().sum() / (T * n * (n - 1))
+            
+            if use_d_weight:
+                _loss = _loss / avg_depth_inst / 10.
+            
+            loss += _loss
+
+    return loss
+
 
 
 def huber_loss(x: Float[Tensor, "*"], y: Float[Tensor, "*"], delta: float = 1.0) -> Float[Tensor, "*"]:

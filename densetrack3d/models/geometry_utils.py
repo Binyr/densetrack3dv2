@@ -42,7 +42,6 @@ def _project_3d2d(trajs_3d, intrs):
 def reproject_2d3d(trajs_uvd, intrs):
 
     B, T, N = trajs_uvd.shape[:3]
-
     trajs_3d = _reproject_2d3d(trajs_uvd.reshape(-1, N, 3), intrs.reshape(-1, 3, 3))
     trajs_3d = rearrange(trajs_3d, "(B T) N C -> B T N C", T=T)
 

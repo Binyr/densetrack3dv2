@@ -144,7 +144,18 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim: int, pos: torch.Tensor) -> torc
     emb_sin = torch.sin(out)  # (M, D/2)
     emb_cos = torch.cos(out)  # (M, D/2)
 
-    emb = torch.cat([emb_sin, emb_cos], dim=1)  # (M, D)
+    # emb = torch.cat([emb_sin, emb_cos], dim=1)  # (M, D)
+    
+    if embed_dim == 1032 or embed_dim == 1032 // 2:
+        emb = torch.cat([emb_sin, emb_cos], dim=1)  # (M, D)
+    else:
+        if embed_dim == 1288:
+            h = 1032 // 2
+        elif embed_dim == 1288 // 2:
+            h = 1032 // 2 // 2
+        else:
+            raise
+        emb = torch.cat([emb_sin[:, :h], emb_cos[:, :h], emb_sin[:, h:], emb_cos[:, h:]], dim=1)
     return emb[None].float()
 
 

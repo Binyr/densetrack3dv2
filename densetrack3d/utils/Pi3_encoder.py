@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from einops import rearrange
-
+from submodules.Pi3.pi3.models.pi3 import Pi3
 
 REPOV3_DIR = "/mnt/shared-storage-user/binyanrui/Projects/dinov3"
 DINOV3_DIR = "/mnt/shared-storage-user/si-data/DINOv3/"
@@ -23,7 +23,7 @@ NAME_TO_PATCH = {
 
 }
 
-class DINO_Encoder(torch.nn.Module):
+class Pi3_Encoder(torch.nn.Module):
     IMAGENET_DEFAULT_MEAN = [0.485, 0.456, 0.406]
     IMAGENET_DEFAULT_STD = [0.229, 0.224, 0.225]
 
@@ -36,19 +36,17 @@ class DINO_Encoder(torch.nn.Module):
         patch_size = (64, 64), # H, W
         use_deconv1 = False,
         use_deconv2 = False,
-        use_anyup = False,
-        dtype=torch.float32 # torch.bfloat16
+        dtype=torch.bfloat16
     ):
-        super(DINO_Encoder, self).__init__()
+        super(Pi3_Encoder, self).__init__()
         
-        REPO_DIR, _, weight_path, stride, C = NAME_TO_PATCH[model_name]
-        if stride == 16: # v3
-            self.model = torch.hub.load(REPO_DIR, model_name, source='local', weights=weight_path)
-        elif stride == 14: # v2
-            self.model = torch.hub.load(REPO_DIR, model_name, source='local', weight_path=weight_path)
+        self.model = Pi3.from_pretrained("/mnt/shared-storage-user/idc2-shared/binyanrui/pretrained_models/Pi3").to(device).eval()
         self.model.eval().to(device).to(dtype)
-        self.stride = stride
-        self.C = C
+        self.stride = 14
+        self.C = 2048
+
+        stride = self.stride
+        C = self.C
 
         self.device = device
         self.antialias = antialias
@@ -99,10 +97,6 @@ class DINO_Encoder(torch.nn.Module):
             
             torch.nn.init.xavier_uniform_(self.deconv2.weight, gain=1.0) # nonlinearity="conv_transpose2d")
             self.C = out_channels2
-        
-        self.use_anyup = use_anyup
-        if use_anyup:
-            self.upsampler = torch.hub.load(repo_or_dir="/mnt/shared-storage-user/binyanrui/Projects/anyup", model='anyup', source="local")
 
     
     def _get_deconv_cfg(self, deconv_kernel):
@@ -159,38 +153,36 @@ class DINO_Encoder(torch.nn.Module):
         for param in self.model.parameters():
             param.requires_grad = False
 
-    def encoder(self, x, size=None):
+    def encoder(self, x, size=None, return_every=False):
         '''
-        x: [b h w c], range from (-1, 1), rbg
+        x: [b t h w c], range from (-1, 1), rbg
         '''
         ori_dtype = x.dtype
         self.to(self.dtype)
         x = x.to(self.dtype)
         x = self.preprocess(x, size).to(self.device, self.dtype)
 
-        b, c, h, w = x.shape
+        b, t, c, h, w = x.shape
         patch_h, patch_w = h // self.stride, w // self.stride
 
-        embeddings = self.model.forward_features(x)['x_norm_patchtokens']
-        embeddings = rearrange(embeddings, 'b (h w) c -> b h w c', h = patch_h, w = patch_w)
+        embeddings_lis = self.model.encode_image(x, return_every=return_every)
 
-        embeddings = rearrange(embeddings, 'b h w c -> b c h w')
-
-        if self.use_deconv1 or self.use_deconv2:
-            embeddings = self.forward_deconv(embeddings)
-
-        embeddings = embeddings.to(ori_dtype)
+        if not isinstance(embeddings_lis, list):
+            embeddings_lis = [embeddings_lis]
         
-        if self.use_anyup:
-            if b > 32:
-                chunck = []
-                for i in range(0, b, 32):
-                    tmp = self.upsampler(x[i:i+32], embeddings[i:i+32], output_size=[192, 256])
-                    chunck.append(tmp)
-                embeddings = torch.cat(chunck)
-            else:
-                embeddings = self.upsampler(x, embeddings, output_size=[192, 256])
-        return embeddings
+        for i in range(len(embeddings_lis)):
+            embeddings = embeddings_lis[i]
+
+            embeddings = rearrange(embeddings, 'b t h w c -> (b t) c h w')
+
+            if self.use_deconv1 or self.use_deconv2:
+                embeddings = self.forward_deconv(embeddings)
+
+            embeddings = embeddings.to(ori_dtype)
+            embeddings = rearrange(embeddings, '(b t) c h w -> b t c h w', b=b)
+
+            embeddings_lis[i] = embeddings
+        return embeddings_lis
 
     def preprocess(self, x, size=None):
         ''' x
@@ -201,6 +193,8 @@ class DINO_Encoder(torch.nn.Module):
                 size = (self.size, self.size)
             else:
                 size = self.size
+        b, t = x.shape[:2]
+        x = rearrange(x, "b t c h w -> (b t) c h w")
         x = torch.nn.functional.interpolate(
             x,
             size=size,
@@ -208,12 +202,10 @@ class DINO_Encoder(torch.nn.Module):
             align_corners=True,
             antialias=self.antialias,
         )
+        x = rearrange(x, "(b t) c h w -> b t c h w", b=b, t=t)
 
+        # to [0, 1]
         x = (x + 1.0) / 2.0
-        # renormalize according to dino
-        mean = self.mean.view(1, 3, 1, 1).to(x.device)
-        std = self.std.view(1, 3, 1, 1).to(x.device)
-        x = (x - mean) / std
 
         return x
     
@@ -235,9 +227,6 @@ class DINO_Encoder(torch.nn.Module):
                 self.deconv1.to(device)
             if self.use_deconv2:
                 self.deconv2.to(device)
-        
-        if self.use_anyup:
-            self.upsampler.to(device)
         return self
 
     def forward(self, x, **kwargs):

@@ -141,10 +141,19 @@ class TapVid3DDataset(Dataset):
 
         queries_xyt = in_npz["queries_xyt"]
         tracks_xyz = in_npz["tracks_XYZ"]
+        
         visibles = in_npz["visibility"]
         intrinsics_params = in_npz["fx_fy_cx_cy"]
 
         tracks_uv, _ = project_points_to_video_frame(tracks_xyz, intrinsics_params, video.shape[1], video.shape[2])
+
+        # - binyanrui: the original query is noisy, use some point in gt_traj instead
+        
+        q_t = queries_xyt[:, 2].astype(np.int32)
+        ttt = np.arange(queries_xyt.shape[0])
+        queries_xyt = np.concatenate([tracks_uv[q_t, ttt], q_t[:, None]], axis=1)
+        
+        
 
         scaling_factor = 1.0
         intrinsics_params_resized = intrinsics_params * scaling_factor

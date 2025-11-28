@@ -6,13 +6,27 @@ model_name: "densetrack3dv2"
 restore_ckpt: "../DELTA_densetrack3d/checkpoints/densetrack3d.pth"
 ckpt_path: logdirs/densetrack3dv2
 
+use_dense: True
 freeze_fnet: false
 freeze_corr4DCNN: false
 freeze_temperal_attn: false
 distribute_window: false
 num_traj_groups: null
-use_dino: null
-dino_size: 1024
+use_dino: ""
+dino_size: "(32, 32)"
+freeze_dino: False
+use_deconv1: false
+use_deconv2: false
+use_anyup: False
+use_merge_conv: False
+merge_dino_method: "cat"
+merge_dino_corr_method: "mask"
+radius_corr: 3
+stride_corr: 1
+radius_supp: 3
+stride_supp: 1
+
+cycle_loss: False
 
 batch_size: 1
 num_nodes: 1
@@ -26,6 +40,7 @@ lr: 0.0002
 wdecay: 0.00001
 num_steps: 50000
 # num_steps: 30000
+
 
 evaluate_every_n_epoch: 4
 save_every_n_epoch: 4
@@ -66,8 +81,20 @@ model: DenseTrack3DV2(
     freeze_fnet=${freeze_fnet},
     freeze_corr4DCNN=${freeze_corr4DCNN},
     num_traj_groups=${num_traj_groups},
-    use_dino=${use_dino},
-    dino_size=${dino_size},
+    use_dino="${use_dino}",
+    dino_size="${dino_size}",
+    freeze_dino=${freeze_dino},
+    use_deconv1=${use_deconv1},
+    use_deconv2=${use_deconv2},
+    use_anyup=${use_anyup},
+    use_merge_conv=${use_merge_conv},
+    merge_dino_method="${merge_dino_method}",
+    merge_dino_corr_method="${merge_dino_corr_method}",
+    radius_corr="${radius_corr}",
+    stride_corr="${stride_corr}",
+    radius_supp="${radius_supp}",
+    stride_supp="${stride_supp}",
+    cycle_loss=${cycle_loss}
   )
 
 accum_iter: 1
@@ -77,6 +104,7 @@ lambda_2d: 50.0
 lambda_d: 1.0
 lambda_vis: 0.1
 lambda_conf: 0.1
+lambda_rigid_loss: null
 
 hydra:
   verbose: True

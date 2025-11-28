@@ -16,6 +16,7 @@ from matplotlib import cm
 from PIL import Image, ImageDraw
 
 import mediapy as media
+import cv2
 
 
 def flow_to_rgb(flow, transparent=False):
@@ -64,6 +65,14 @@ def draw_circle(rgb, coord, radius, color=(255, 0, 0), visible=True):
     )
     return rgb
 
+def draw_rectangle(rgb, xy, color, linewidth):
+    draw = ImageDraw.Draw(rgb)
+    draw.rectangle(
+        xy=xy,
+        outline=tuple(color),
+        width=linewidth,
+    )
+    return rgb
 
 def draw_line(rgb, coord_y, coord_x, color, linewidth):
     draw = ImageDraw.Draw(rgb)
@@ -118,6 +127,7 @@ class Visualizer:
         save_video: bool = True,
         compensate_for_camera_motion: bool = False,
         default_color: np.ndarray = None,
+        queries = None, # B,N,4 (t u v d)
     ):
         if compensate_for_camera_motion:
             assert segm_mask is not None
@@ -147,6 +157,7 @@ class Visualizer:
             query_frame=query_frame,
             compensate_for_camera_motion=compensate_for_camera_motion,
             default_color=default_color,
+            queries=queries,
         )
         if save_video:
             self.save_video(res_video, filename=filename, writer=writer, step=step)
@@ -275,6 +286,7 @@ class Visualizer:
         query_frame: int = 0,
         compensate_for_camera_motion=False,
         default_color: np.ndarray = None,
+        queries=None, # B,N,4 (t u v d)
     ):
         B, T, C, H, W = video.shape
         _, _, N, D = tracks.shape
@@ -293,7 +305,12 @@ class Visualizer:
             res_video.append(rgb.copy())
         vector_colors = np.zeros((T, N, 3))
 
-        if self.mode == "optical_flow":
+        if N < 20:
+            cmap = plt.get_cmap("tab20")
+            colors = [tuple(int(255 * c) for c in cmap(i)[:3]) for i in range(20)]
+            for i in range(N):
+                vector_colors[:, i] = np.array(colors[i])
+        elif self.mode == "optical_flow":
             import flow_vis
 
             vector_colors = flow_vis.flow_to_color(tracks - tracks[query_frame][None])
@@ -335,6 +352,7 @@ class Visualizer:
                 color[segm_mask > 0] = np.array(self.color_map(1.0)[:3]) * 255.0
                 color[segm_mask <= 0] = np.array(self.color_map(0.0)[:3]) * 255.0
                 vector_colors = np.repeat(color[None], T, axis=0)
+
 
         if default_color is not None:
             vector_colors = np.repeat(default_color[None], T, axis=0)
@@ -384,7 +402,12 @@ class Visualizer:
         
         if gt_tracks is not None:
             for t in range(query_frame, T):
-                res_video[t] = self._draw_gt_tracks(res_video[t], gt_tracks[t : t + 1])
+                is_query_frames = None
+                if queries is not None:
+                    is_query_frames = queries[0, :, 0] == t # N
+                res_video[t] = self._draw_gt_tracks(res_video[t], gt_tracks[t : t + 1],
+                                                    vector_colors=vector_colors,
+                                                    is_query_frames=is_query_frames)
 
         #  construct the final rgb sequence
         if self.show_first_frame > 0:
@@ -424,6 +447,8 @@ class Visualizer:
         self,
         rgb: np.ndarray,  # H x W x 3,
         gt_tracks: np.ndarray,  # T x 2
+        vector_colors = None, # T x N x 3
+        is_query_frames = None # B x N x 4 (t u v d)
     ):
         T, N, _ = gt_tracks.shape
         color = np.array((211, 0, 0))
@@ -431,6 +456,15 @@ class Visualizer:
         
         for t in range(T):
             for i in range(N):
+                # binyanrui
+                if vector_colors is not None:
+                    color = vector_colors[t, i].astype(int)
+                
+                is_query_frame = False
+                if is_query_frames is not None:
+                    is_query_frame = is_query_frames[i]
+                # binyanrui
+                
                 gt_track = gt_tracks[t][i]
                 #  draw a red cross
                 if gt_track[0] > 0 and gt_track[1] > 0:
@@ -444,6 +478,15 @@ class Visualizer:
                         color,
                         self.linewidth,
                     )
+                    
+                    if is_query_frame:
+                        
+                        rgb = draw_rectangle(
+                            rgb,
+                            xy=[coord_x, coord_y],
+                            color=tuple(color.tolist()),
+                            linewidth=self.linewidth
+                        )
                     coord_y = (int(gt_track[0]) - length, int(gt_track[1]) + length)
                     coord_x = (int(gt_track[0]) + length, int(gt_track[1]) - length)
                     rgb = draw_line(
@@ -453,5 +496,7 @@ class Visualizer:
                         color,
                         self.linewidth,
                     )
+
+    
         rgb = np.array(rgb)
         return rgb

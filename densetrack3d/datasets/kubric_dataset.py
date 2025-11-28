@@ -205,7 +205,7 @@ class BasicDataset(torch.utils.data.Dataset):
 
         return rgbs, trajs, visibles, sparse_trajs, sparse_visibles
 
-    def add_spatial_augs(self, rgbs, depths, pred_depths, trajs, trajs_depth, visibles, flows, flow_depths, sparse_trajs, sparse_visibles):
+    def add_spatial_augs(self, rgbs, depths, pred_depths, trajs, trajs_depth, visibles, flows, flow_depths, sparse_trajs, sparse_visibles, dense_queries_inst_id):
         # T, N, __ = trajs.shape
 
         S = len(rgbs)
@@ -360,6 +360,8 @@ class BasicDataset(torch.utils.data.Dataset):
         flows = [flow[y0 : y0 + self.crop_size[0], x0 : x0 + self.crop_size[1]] for flow in flows]
         flow_depths = [flow_depth[y0 : y0 + self.crop_size[0], x0 : x0 + self.crop_size[1]] for flow_depth in flow_depths]
         visibles = [visible[y0 : y0 + self.crop_size[0], x0 : x0 + self.crop_size[1]] for visible in visibles]
+        
+        dense_queries_inst_id = dense_queries_inst_id[y0 : y0 + self.crop_size[0], x0 : x0 + self.crop_size[1]]
 
         for i in range(len(trajs)):
             trajs[i][:, :, 0] -= x0
@@ -436,7 +438,7 @@ class BasicDataset(torch.utils.data.Dataset):
         out_of_bound_sparse_traj = (sparse_trajs[...,0] < 0) | (sparse_trajs[...,0] > self.crop_size[1] - 1) | (sparse_trajs[...,1] < 0) | (sparse_trajs[...,1] > self.crop_size[0] - 1)
         sparse_visibles[out_of_bound_sparse_traj] = 0
 
-        return rgbs, depths, pred_depths, trajs, trajs_depth, visibles, flows, flow_depths, sparse_trajs, sparse_visibles
+        return rgbs, depths, pred_depths, trajs, trajs_depth, visibles, flows, flow_depths, sparse_trajs, sparse_visibles, dense_queries_inst_id
 
     def crop_rgb_and_flow(self, rgbs, depths, pred_depths, trajs, trajs_depth, visibles, flows, flow_depths, sparse_trajs, sparse_visibles, random=True):
 
@@ -682,6 +684,7 @@ class KubricDataset(BasicDataset):
             dense_traj_depth = dense_annot_dict["reproj_depth"].astype(np.float32)[..., None]
             dense_visibility = dense_annot_dict["visibility"].astype(bool)
             dense_queries = dense_annot_dict["queries"].astype(np.float32) # N, 3
+            dense_queries_inst_id = dense_annot_dict["query_points_instance_id"].astype(np.int32)
         else:
             is_reverse = True
             npy_dense_path = os.path.join(data_root_, seq_name, seq_name + "_dense_reverse.npy")
@@ -699,6 +702,7 @@ class KubricDataset(BasicDataset):
                 dense_traj_depth = dense_annot_dict["reproj_depth"].astype(np.float32)[..., None]
                 dense_visibility = dense_annot_dict["visibility"].astype(bool)
                 dense_queries = dense_annot_dict["queries"].astype(np.float32) # N, 3
+                dense_queries_inst_id = dense_annot_dict["query_points_instance_id"].astype(np.int32)
 
         npy_path = os.path.join(data_root_, seq_name, seq_name + ".npy")
         if self.read_from_s3:
@@ -717,6 +721,7 @@ class KubricDataset(BasicDataset):
             sparse_visibility = annot_dict["visibility"].astype(bool)
             sparse_queries = annot_dict["queries"].astype(np.float32)
             depth_range = annot_dict["depth_range"].astype(float)
+            sparse_queries_inst_id = annot_dict["query_points_instance_id"].astype(np.int32)
         # sparse_queries = annot_dict["sparse_queries"].astype(np.float32) # N, 3
 
         # if self.use_gt_depth:
@@ -793,14 +798,15 @@ class KubricDataset(BasicDataset):
         dense_flows = dense_traj_grid - ori_grid
         dense_flow_depths = dense_traj_depth_grid - dense_traj_depth_grid[0:1]
 
+        dense_queries_inst_id = dense_queries_inst_id[sort_indices].reshape(512, 512)
             
         # else:
         if not self.is_val:
             if self.use_augs:
                 rgbs, dense_traj_grid, dense_visi_maps, sparse_traj_2d, sparse_visibility = \
                     self.add_photometric_augs(rgbs, dense_traj_grid, dense_visi_maps, sparse_traj_2d, sparse_visibility)
-                rgbs, depths, pred_depths, dense_traj_grid, dense_traj_depth_grid, dense_visi_maps, dense_flows, dense_flow_depths, sparse_traj_2d, sparse_visibility = \
-                    self.add_spatial_augs(rgbs, depths, pred_depths, dense_traj_grid, dense_traj_depth_grid, dense_visi_maps, dense_flows, dense_flow_depths, sparse_traj_2d, sparse_visibility)
+                rgbs, depths, pred_depths, dense_traj_grid, dense_traj_depth_grid, dense_visi_maps, dense_flows, dense_flow_depths, sparse_traj_2d, sparse_visibility, dense_queries_inst_id = \
+                    self.add_spatial_augs(rgbs, depths, pred_depths, dense_traj_grid, dense_traj_depth_grid, dense_visi_maps, dense_flows, dense_flow_depths, sparse_traj_2d, sparse_visibility, dense_queries_inst_id)
             else:
                 rgbs, depths, pred_depths, dense_traj_grid, dense_traj_depth_grid, dense_visi_maps, dense_flows, dense_flow_depths, sparse_traj_2d, sparse_visibility = self.crop_rgb_and_flow(rgbs, depths, pred_depths, dense_traj_grid, dense_traj_depth_grid, dense_visi_maps, dense_flows, dense_flow_depths, sparse_traj_2d, sparse_visibility)
         else:
@@ -829,6 +835,9 @@ class KubricDataset(BasicDataset):
         sparse_traj_depth = torch.from_numpy(np.ascontiguousarray(sparse_traj_depth)).float()
         sparse_visibility = torch.from_numpy(np.ascontiguousarray(sparse_visibility)).float()
 
+        dense_queries_inst_id = torch.from_numpy(dense_queries_inst_id)
+        sparse_queries_inst_id = torch.from_numpy(sparse_queries_inst_id)
+
         if not self.is_val:
             visibile_pts_first_frame_inds = (sparse_visibility[0]).nonzero(as_tuple=False)[:, 0]
             if self.sample_vis_1st_frame:
@@ -850,11 +859,13 @@ class KubricDataset(BasicDataset):
             sparse_traj_2d = sparse_traj_2d[:, visible_inds_sampled].float()
             sparse_traj_depth = sparse_traj_depth[:, visible_inds_sampled].float()
             sparse_visibility = sparse_visibility[:, visible_inds_sampled]
+            sparse_queries_inst_id = sparse_queries_inst_id[visible_inds_sampled]
         sparse_valids = torch.ones_like(sparse_visibility)
 
         # print("videodepth", depths.max(), depths.min())
 
         depth_init = depths[0].clone()
+        depth_init_last = depths[-1].clone()
         if not self.is_val and self.use_augs:
             depths = aug_depth(depths,
                     grid=(8, 8),
@@ -905,6 +916,9 @@ class KubricDataset(BasicDataset):
             depth_min=torch.tensor(depth_range[0]),
             depth_max=torch.tensor(depth_range[1]),
             intrs=intrinsic_mat,
+            dense_queries_inst_id=dense_queries_inst_id,
+            sparse_queries_inst_id=sparse_queries_inst_id,
+            depth_init_last=depth_init_last
         )
 
         # print(sample)

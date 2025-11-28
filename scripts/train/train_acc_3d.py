@@ -18,11 +18,12 @@ from densetrack3d.datasets.utils import collate_fn, collate_fn_train, dataclass_
 from densetrack3d.evaluation.core.evaluator import Evaluator
 
 from densetrack3d.models.densetrack3d.densetrack3d import DenseTrack3D
-from densetrack3d.models.densetrack3d.densetrack3dv2 import DenseTrack3DV2
+# from densetrack3d.models.densetrack3d.densetrack3dv2 import DenseTrack3DV2
+from densetrack3d.models.densetrack3d.densetrack3dv2_cycle_consist import DenseTrack3DV2
 
 
 from densetrack3d.models.evaluation_predictor.evaluation_predictor import EvaluationPredictor
-from densetrack3d.models.loss import balanced_bce_loss, seq_balanced_bce_loss, bce_loss, seq_bce_loss, confidence_loss, seq_confidence_loss, track_loss
+from densetrack3d.models.loss import balanced_bce_loss, seq_balanced_bce_loss, bce_loss, seq_bce_loss, confidence_loss, seq_confidence_loss, track_loss, rigid_instane_loss
 from densetrack3d.models.model_utils import (
     bilinear_sampler,
     dense_to_sparse_tracks_3d_in_3dspace,
@@ -57,7 +58,7 @@ from collections import defaultdict, OrderedDict
 
 TAPVID2D_DIR = None
 # KUBRIC3D_MIX_DIR = "datasets/kubric/movif_512x512_dense_3d_processed/"
-KUBRIC3D_MIX_DIR = "datasets/kubric_DELTA/movif/kubric_processed_mix_3d/"
+KUBRIC3D_MIX_DIR = "datasets/kubric_DELTA/movif/kubric_processed_mix_3d_instance/"
 
 logging.getLogger('boto3').setLevel(logging.CRITICAL)
 logging.getLogger('botocore').setLevel(logging.CRITICAL)
@@ -65,6 +66,52 @@ logging.getLogger('nose').setLevel(logging.CRITICAL)
 logging.getLogger('urllib3').setLevel(logging.CRITICAL)
 logging.getLogger('PIL').setLevel(logging.CRITICAL)
 logging.getLogger('trimesh').setLevel(logging.CRITICAL)
+
+def vis_instance_mask(batch):
+    import matplotlib.pyplot as plt
+    from PIL import Image
+    from scipy.ndimage import label
+    import mediapy as media
+    cmap = plt.get_cmap("tab20")
+    colors = [tuple(int(255 * c) for c in cmap(i)[:3]) for i in range(20)]
+
+    dense_queries_inst_id = batch.dense_queries_inst_id[0].cpu().numpy()
+
+    
+    # no need, is already instance seg
+    if False:
+        instance_mask = np.zeros_like(dense_queries_inst_id, dtype=np.int32)
+        current_id = 1
+        for sem_id in np.unique(dense_queries_inst_id):
+            if sem_id == 0:  # skip background if 0
+                continue
+            labeled, num = label(dense_queries_inst_id == sem_id)
+            labeled[labeled > 0] += current_id - 1
+            instance_mask += labeled
+            current_id += num
+    
+    H, W = dense_queries_inst_id.shape
+    # sem mask
+    max_sem_id = dense_queries_inst_id.max()
+    vis_sem_id = np.zeros((H, W, 3), dtype=np.uint8)
+    for i in range(max_sem_id + 1):
+        vis_sem_id[dense_queries_inst_id == i] = np.array(colors[i])
+    
+    # instance mask
+    videos = batch.video[0].permute(0, 2, 3, 1).cpu().numpy().astype(np.uint8)
+    media.write_video(
+                "vis_video.mp4",
+                videos,
+                fps=10,
+            )
+    
+    rgb = batch.video[0, 0].permute(1, 2, 0).cpu().numpy().astype(np.uint8)
+
+    vis = np.concatenate([rgb, vis_sem_id], axis=1)
+    Image.fromarray(vis).save("vis_inst_id.png")
+
+
+    
 
 def sample_sparse_queries(trajs_g, trajs_d, vis_g):
     B, T, N, D = trajs_g.shape
@@ -107,6 +154,7 @@ def forward_batch(batch, model, args, accelerator=None):
     video = batch.video
     videodepth = batch.videodepth
     depth_init = batch.depth_init
+    depth_init_last = batch.depth_init_last
 
     max_depth = videodepth[videodepth > 0.01].max()
 
@@ -131,24 +179,32 @@ def forward_batch(batch, model, args, accelerator=None):
     #############################
     # n_input_queries = 256
     # NOTE add regular grid queries:
-    grid_xy = get_points_on_a_grid((12, 16), video.shape[3:]).long().float()
-    grid_xy = torch.cat([torch.zeros_like(grid_xy[:, :, :1]), grid_xy], dim=2).to(device)  # B, N, C
-    grid_xy_d = bilinear_sampler(depth_init, rearrange(grid_xy[..., 1:3], "b n c -> b () n c"), mode="nearest")
-    grid_xy_d = rearrange(grid_xy_d, "b c m n -> b (m n) c")
+    def get_grid_queries(depth_init):
+        grid_xy = get_points_on_a_grid((12, 16), video.shape[3:]).long().float()
+        grid_xy = torch.cat([torch.zeros_like(grid_xy[:, :, :1]), grid_xy], dim=2).to(device)  # B, N, C
+        grid_xy_d = bilinear_sampler(depth_init, rearrange(grid_xy[..., 1:3], "b n c -> b () n c"), mode="nearest")
+        grid_xy_d = rearrange(grid_xy_d, "b c m n -> b (m n) c")
+        grid_queries = torch.cat([grid_xy, grid_xy_d], dim=-1)
+        return grid_queries
 
-    grid_queries = torch.cat([grid_xy, grid_xy_d], dim=-1)
-    input_queries = torch.cat([sparse_queries, grid_queries], dim=1)
-    # input_queries = sparse_queries
+    grid_queries = get_grid_queries(depth_init)
+    grid_queries_last = get_grid_queries(depth_init_last)
+    
+    # input_queries = torch.cat([sparse_queries, grid_queries], dim=1)
+    input_queries = sparse_queries
     # with torch.amp.autocast(device_type=device.type, enabled=True):
-    sparse_predictions, dense_predictions, (sparse_train_data_dict, dense_train_data_dict) = model(
+    sparse_predictions, dense_predictions, (sparse_train_data_dict, dense_train_data_dict), _, _, _ = model(
         video=video,
         videodepth=videodepth,
         sparse_queries=input_queries,
         depth_init=depth_init,
         iters=args.train_iters,
         is_train=True,
-        use_dense=True,
+        use_dense=args.use_dense,
         accelerator=accelerator,
+        grid_queries=grid_queries,
+        grid_queries_last=grid_queries_last,
+        depth_init_last=depth_init_last,
     )
 
     coord_predictions = sparse_train_data_dict["coords"]
@@ -156,12 +212,12 @@ def forward_batch(batch, model, args, accelerator=None):
     vis_predictions = sparse_train_data_dict["vis"]
     conf_predictions = sparse_train_data_dict["conf"]
     valid_mask = sparse_train_data_dict["mask"]
-
-    dense_coord_predictions = dense_train_data_dict["coords"]
-    dense_coord_depth_predictions = dense_train_data_dict["coord_depths"]
-    dense_vis_predictions = dense_train_data_dict["vis"]
-    dense_conf_predictions = dense_train_data_dict["conf"]
-    (x0, y0) = dense_train_data_dict["x0y0"]
+    if args.use_dense:
+        dense_coord_predictions = dense_train_data_dict["coords"]
+        dense_coord_depth_predictions = dense_train_data_dict["coord_depths"]
+        dense_vis_predictions = dense_train_data_dict["vis"]
+        dense_conf_predictions = dense_train_data_dict["conf"]
+        (x0, y0) = dense_train_data_dict["x0y0"]
 
     S = args.sliding_window_len
 
@@ -169,6 +225,7 @@ def forward_batch(batch, model, args, accelerator=None):
     seq_depth_loss = torch.tensor(0.0, requires_grad=True).cuda()
     vis_loss = torch.tensor(0.0, requires_grad=True).cuda()
     conf_loss = torch.tensor(0.0, requires_grad=True).cuda()
+    rigid_loss = torch.tensor(0.0, requires_grad=True).cuda()
 
     for idx, ind in enumerate(range(0, args.sequence_len - S // 2, S // 2)):
 
@@ -177,7 +234,7 @@ def forward_batch(batch, model, args, accelerator=None):
         vis_gt_ = vis_g[:, ind : ind + S].clone()
         valid_gt_ = valids[:, ind : ind + S].clone() * valid_mask[:, ind : ind + S, :n_sparse_queries].clone()
 
-        coord_predictions_ = coord_predictions[idx][:, :, :, :n_sparse_queries, :] # B I T N C
+        coord_predictions_ = coord_predictions[idx][:, :, :, :n_sparse_queries, :].clone() # B I T N C
         coord_depth_predictions_ = coord_depth_predictions[idx][:, :, :, :n_sparse_queries, :]
 
 
@@ -209,98 +266,132 @@ def forward_batch(batch, model, args, accelerator=None):
         conf_loss += seq_confidence_loss(
             coord_predictions_, conf_predictions_, traj_gt_, vis_gt_, valid_gt_, expected_dist_thresh=12.0 / (W - 1), divide_n_repeat=False
         )
+        # 
+        if args.lambda_rigid_loss is not None:
+            traj_inst_ids = batch.sparse_queries_inst_id.clone()
+            intrs = batch.intrs[:, ind:ind+S].clone()
+            coord_predictions_uv_space = coord_predictions[idx][:, :, :, :n_sparse_queries, :]
+            # import pdb
+            # pdb.set_trace()
+            pred_uvd = torch.cat([coord_predictions_uv_space, traj_d_gt_.unsqueeze(1).repeat(1, coord_predictions_uv_space.shape[1], 1, 1, 1)], axis=-1)
+            gt_uvd = torch.cat([trajs_g[:, ind : ind + S], traj_d_gt_], axis=-1)
+            rigid_loss += rigid_instane_loss(traj_inst_ids, gt_uvd, pred_uvd, intrs)
 
     seq_loss = seq_loss * args.lambda_2d / len(coord_predictions)
     seq_depth_loss = seq_depth_loss * args.lambda_d / len(coord_predictions)
     vis_loss = vis_loss * args.lambda_vis / len(coord_predictions)
     conf_loss = conf_loss * args.lambda_conf / len(coord_predictions)
+    if args.lambda_rigid_loss is not None:
+        rigid_loss = rigid_loss * args.lambda_rigid_loss / len(coord_predictions)
 
     dense_seq_loss = torch.tensor(0.0, requires_grad=True).cuda()
     dense_seq_depth_loss = torch.tensor(0.0, requires_grad=True).cuda()
     dense_vis_loss = torch.tensor(0.0, requires_grad=True).cuda()
     dense_conf_loss = torch.tensor(0.0, requires_grad=True).cuda()
+    dense_rigid_loss = torch.tensor(0.0, requires_grad=True).cuda()
+
+    if args.use_dense:
+        for idx, ind in enumerate(range(0, args.sequence_len - S // 2, S // 2)):
+
+            if idx >= len(dense_coord_predictions):
+                break
+
+            dense_coord_prediction_ = dense_coord_predictions[idx][0].clone()  # I T, 3, H, W
+            dense_coord_depth_prediction_ = dense_coord_depth_predictions[idx][0]  # I T, 3, H, W
+            dense_vis_prediction_ = dense_vis_predictions[idx][0]  # I, T,  H, W
+            dense_conf_prediction_ = dense_conf_predictions[idx][0]  # I, T,  H, W
 
 
-    for idx, ind in enumerate(range(0, args.sequence_len - S // 2, S // 2)):
+            if len(dense_vis_prediction_.shape) == 3: # T H W
+                dense_vis_prediction_ = dense_vis_prediction_.unsqueeze(0)
+                dense_conf_prediction_ = dense_conf_prediction_.unsqueeze(0)
 
-        if idx >= len(dense_coord_predictions):
-            break
+            pred_H, pred_W = dense_coord_prediction_.shape[-2:]
 
-        dense_coord_prediction_ = dense_coord_predictions[idx][0]  # I T, 3, H, W
-        dense_coord_depth_prediction_ = dense_coord_depth_predictions[idx][0]  # I T, 3, H, W
-        dense_vis_prediction_ = dense_vis_predictions[idx][0]  # I, T,  H, W
-        dense_conf_prediction_ = dense_conf_predictions[idx][0]  # I, T,  H, W
+            gt_dense_traj_d = dense_trajectory_d[
+                0, ind : ind + S, :, y0[0] * model_stride : (y0[0] * model_stride + pred_H), x0[0] * model_stride : (x0[0] * model_stride + pred_W)
+            ].clone()  # T 1 H_crop W_crop
+            gt_alpha = flow_alpha[
+                0, ind : ind + S, y0[0] * model_stride : (y0[0] * model_stride + pred_H), x0[0] * model_stride : (x0[0] * model_stride + pred_W)
+            ].clone()  # T 2 H W
+            gt_flow = flow[
+                0, ind : ind + S, :, y0[0] * model_stride : (y0[0] * model_stride + pred_H), x0[0] * model_stride : (x0[0] * model_stride + pred_W)
+            ].clone()  # T 2 H_crop W_crop
 
+            I, S = dense_coord_prediction_.shape[:2]
 
-        if len(dense_vis_prediction_.shape) == 3: # T H W
-            dense_vis_prediction_ = dense_vis_prediction_.unsqueeze(0)
-            dense_conf_prediction_ = dense_conf_prediction_.unsqueeze(0)
+            dense_grid_2d = get_grid(pred_H, pred_W, normalize=False, device=dense_coord_prediction_.device)  # H W 2
+            dense_grid_2d[..., 0] += x0[0] * model_stride
+            dense_grid_2d[..., 1] += y0[0] * model_stride
+            dense_grid_2d = rearrange(dense_grid_2d, "h w c -> () c h w")
 
-        pred_H, pred_W = dense_coord_prediction_.shape[-2:]
+            gt_coord_ = gt_flow + dense_grid_2d
 
-        gt_dense_traj_d = dense_trajectory_d[
-            0, ind : ind + S, :, y0[0] * model_stride : (y0[0] * model_stride + pred_H), x0[0] * model_stride : (x0[0] * model_stride + pred_W)
-        ].clone()  # T 1 H_crop W_crop
-        gt_alpha = flow_alpha[
-            0, ind : ind + S, y0[0] * model_stride : (y0[0] * model_stride + pred_H), x0[0] * model_stride : (x0[0] * model_stride + pred_W)
-        ].clone()  # T 2 H W
-        gt_flow = flow[
-            0, ind : ind + S, :, y0[0] * model_stride : (y0[0] * model_stride + pred_H), x0[0] * model_stride : (x0[0] * model_stride + pred_W)
-        ].clone()  # T 2 H_crop W_crop
-
-        I, S = dense_coord_prediction_.shape[:2]
-
-        dense_grid_2d = get_grid(pred_H, pred_W, normalize=False, device=dense_coord_prediction_.device)  # H W 2
-        dense_grid_2d[..., 0] += x0[0] * model_stride
-        dense_grid_2d[..., 1] += y0[0] * model_stride
-        dense_grid_2d = rearrange(dense_grid_2d, "h w c -> () c h w")
-
-        gt_coord_ = gt_flow + dense_grid_2d
-
-        gt_coord_[:, 0] /= W - 1
-        gt_coord_[:, 1] /= H - 1
+            gt_coord_[:, 0] /= W - 1
+            gt_coord_[:, 1] /= H - 1
 
 
-        dense_coord_prediction_[:, :, 0] /= W - 1
-        dense_coord_prediction_[:, :, 1] /= H - 1
+            dense_coord_prediction_[:, :, 0] /= W - 1
+            dense_coord_prediction_[:, :, 1] /= H - 1
 
-        gt_dense_traj_d[gt_dense_traj_d < 0.01] = 0.01
-        dense_coord_depth_prediction_[dense_coord_depth_prediction_ < 0.01] = 0.01
-        gt_dense_traj_d /= max_depth
-        dense_coord_depth_prediction_ /= max_depth
+            gt_dense_traj_d[gt_dense_traj_d < 0.01] = 0.01
+            dense_coord_depth_prediction_[dense_coord_depth_prediction_ < 0.01] = 0.01
+            gt_dense_traj_d /= max_depth
+            dense_coord_depth_prediction_ /= max_depth
 
-        
-        dense_seq_loss_ = track_loss(
-            dense_coord_prediction_, 
-            gt_coord_, 
-            is_dense=True, 
-            has_batch_dim=False, 
-            divide_n_repeat=False, 
-            use_huber_loss=False,
-            delta_huber_loss=6.0/W
-        )
-        dense_seq_loss += dense_seq_loss_
-        dense_seq_depth_loss += track_loss(
-            1 / dense_coord_depth_prediction_, 1 / gt_dense_traj_d, is_dense=True, has_batch_dim=False, divide_n_repeat=False,
-        )
-        dense_vis_loss_ = seq_bce_loss(dense_vis_prediction_, gt_alpha, divide_n_repeat=False, has_batch_dim=False)  # bce_loss(dense_vis_prediction_, gt_alpha)
-        dense_vis_loss += dense_vis_loss_
+            
+            dense_seq_loss_ = track_loss(
+                dense_coord_prediction_, 
+                gt_coord_, 
+                is_dense=True, 
+                has_batch_dim=False, 
+                divide_n_repeat=False, 
+                use_huber_loss=False,
+                delta_huber_loss=6.0/W
+            )
+            dense_seq_loss += dense_seq_loss_
+            dense_seq_depth_loss += track_loss(
+                1 / dense_coord_depth_prediction_, 1 / gt_dense_traj_d, is_dense=True, has_batch_dim=False, divide_n_repeat=False,
+            )
+            dense_vis_loss_ = seq_bce_loss(dense_vis_prediction_, gt_alpha, divide_n_repeat=False, has_batch_dim=False)  # bce_loss(dense_vis_prediction_, gt_alpha)
+            dense_vis_loss += dense_vis_loss_
 
-        dense_conf_loss += seq_confidence_loss(
-            dense_coord_prediction_,
-            dense_conf_prediction_,
-            gt_coord_,
-            gt_alpha,
-            expected_dist_thresh=12.0 / W,
-            is_dense=True,
-            has_batch_dim=False,
-            divide_n_repeat=False
-        )
+            dense_conf_loss += seq_confidence_loss(
+                dense_coord_prediction_,
+                dense_conf_prediction_,
+                gt_coord_,
+                gt_alpha,
+                expected_dist_thresh=12.0 / W,
+                is_dense=True,
+                has_batch_dim=False,
+                divide_n_repeat=False
+            )
+            # 
+            if args.lambda_rigid_loss is not None:
+                dense_queries_inst_id = batch.dense_queries_inst_id.clone()
+                traj_inst_ids = dense_queries_inst_id[
+                    0, y0[0] * model_stride : (y0[0] * model_stride + pred_H), x0[0] * model_stride : (x0[0] * model_stride + pred_W)
+                ].clone()  # H_crop W_crop
+                traj_inst_ids = traj_inst_ids.reshape(1, -1)
+                intrs = batch.intrs[:, ind:ind+S].clone()
+                dense_coord_prediction_uv_space = dense_coord_predictions[idx][0]
+                pred_uvd = torch.cat(
+                    [
+                        dense_coord_prediction_uv_space, 
+                        gt_dense_traj_d.unsqueeze(0).repeat(dense_coord_prediction_uv_space.shape[0], 1, 1, 1, 1)
+                    ], 
+                axis=2)
+                pred_uvd = rearrange(pred_uvd, "i t c h w -> i t (h w) c").unsqueeze(0) # B I T N C
+                gt_uvd = torch.cat([gt_flow + dense_grid_2d, gt_dense_traj_d], axis=1)
+                gt_uvd = rearrange(gt_uvd, "t c h w -> t (h w) c").unsqueeze(0)
+                dense_rigid_loss += rigid_instane_loss(traj_inst_ids, gt_uvd, pred_uvd, intrs)
 
-    dense_seq_loss = dense_seq_loss * args.lambda_2d / len(dense_coord_predictions)  # FIXME
-    dense_seq_depth_loss = dense_seq_depth_loss * args.lambda_d / len(dense_coord_predictions)
-    dense_vis_loss = dense_vis_loss * args.lambda_vis / len(dense_coord_predictions)
-    dense_conf_loss = dense_conf_loss * args.lambda_conf / len(dense_coord_predictions)
+        dense_seq_loss = dense_seq_loss * args.lambda_2d / len(dense_coord_predictions)  # FIXME
+        dense_seq_depth_loss = dense_seq_depth_loss * args.lambda_d / len(dense_coord_predictions)
+        dense_vis_loss = dense_vis_loss * args.lambda_vis / len(dense_coord_predictions)
+        dense_conf_loss = dense_conf_loss * args.lambda_conf / len(dense_coord_predictions)
+        if args.lambda_rigid_loss is not None:
+            dense_rigid_loss = dense_rigid_loss * args.lambda_rigid_loss / len(coord_predictions)
 
 
     output = {
@@ -332,6 +423,12 @@ def forward_batch(batch, model, args, accelerator=None):
         "dense_conf": {
             "loss": dense_conf_loss.mean(),
         },
+        "rigid_loss":{
+            "loss": rigid_loss
+        },
+        "dense_rigid_loss":{
+            "loss": dense_rigid_loss
+        }
     }
 
     return output
@@ -377,8 +474,6 @@ def run_test_eval(accelerator, evaluator, model, dataloaders, step):
             }
     
     return metrics
-        
-
 
 
 def seed_everything(seed: int):
@@ -428,6 +523,11 @@ def train(args):
     seed = 0 + accelerator.state.process_index
     seed_everything(seed)
 
+    # visualizer = Visualizer(
+    #     save_dir=args.exp_dir,
+    #     fps=7,
+    # )
+
     model = eval(args.model)
     
     print(f"All model parameters: {sum(p.numel() for p in model.parameters())}")
@@ -437,7 +537,7 @@ def train(args):
     train_dataset = KubricDataset(
         data_root=KUBRIC3D_MIX_DIR,
         crop_size=(384, 512),
-        seq_len=24,
+        seq_len=args.sequence_len,
         traj_per_sample=args.traj_per_sample,
         sample_vis_1st_frame=True,
         use_augs=not args.dont_use_augs,
@@ -459,6 +559,7 @@ def train(args):
         drop_last=True,
     )
     
+    
     # binyanrui - freeze some layer
     # results in slow training
     print("binyanrui")
@@ -472,6 +573,8 @@ def train(args):
         if args.freeze_temperal_attn and name.startswith("updateformer.time_blocks"):
             p.requires_grad = False
         
+        if args.freeze_dino and name.startswith("dino_net"):
+            p.requires_grad = False
         # if name.startswith("upsample_transformer"):
         #     p.requires_grad = False
         # if name.startswith("inter_up"):
@@ -537,7 +640,7 @@ def train(args):
     elif args.restore_ckpt is not None:
         assert args.restore_ckpt.endswith(".pth") or args.restore_ckpt.endswith(".pt")
         logging.info(f"Loading checkpoint {args.restore_ckpt}")
-
+        
         strict = False
         state_dict = torch.load(args.restore_ckpt)
         if "model" in state_dict:
@@ -551,6 +654,10 @@ def train(args):
         for k, v in state_dict.items():
             if k in model_state_dict and v.shape == model_state_dict[k].shape:
                 new_state_dict[k] = v
+            elif k == "updateformer.input_transform.weight":
+                x = torch.zeros_like(model_state_dict[k])
+                x[:, :1032] = v
+                new_state_dict[k] = x
             else:
                 if k in model_state_dict:
                     print(f"{k} can not load. ckpt shape {v.shape} vs model shape {model_state_dict[k].shape}")
@@ -634,10 +741,12 @@ def train(args):
         epoch += 1
 
         for i_batch, batch in enumerate(train_loader):
+            # vis_instance_mask(batch[0])
             with accelerator.accumulate(model):
                 iter_start = time.time()
 
                 batch, gotit = batch
+                # print(i_batch, batch.seq_name)
                 if not all(gotit):
                     print("batch is None")
                     continue
@@ -696,6 +805,20 @@ def train(args):
                                 print_mess += f"{tag}: {loss_value:.6f} | "
 
                         print(print_mess)
+                    
+                    # prepare output, batch for vis
+                    # if output["dense_track_uv"]["loss"].item() > 1. or output["track_uv"]["loss"].item() > 1.:
+                    #     import pdb
+                    #     pdb.set_trace()
+                    #     visualizer.visualize_byr(
+                    #         video=sample.video,  # (B,T,C,H,W)
+                    #         tracks=dense_traj_e_vis,  # (B,T,N,2)
+                    #         visibility=None, # dense_vis_e_vis,  # (B, T, N, 1) bool
+                    #         gt_tracks=gt_traj,  # (B,T,N,2)
+                    #         filename=sample.seq_name[0],
+                    #         writer=None,  # tensorboard Summary Writer, used for visualization during training
+                    #         gt_tracks2=selected_dense_traj_e_vis,
+                    #     )
 
                 if total_steps > args.num_steps:
                     should_keep_training = False

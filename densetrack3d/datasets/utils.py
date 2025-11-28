@@ -69,6 +69,11 @@ class DeltaData:
 
     dense_query_frame: Optional[torch.Tensor] = None  # B, H, W, 2
 
+    dense_queries_inst_id: Optional[torch.Tensor] = None
+    sparse_queries_inst_id: Optional[torch.Tensor] = None
+
+    depth_init_last: torch.Tensor = None
+    
 
 def collate_fn(batch):
     """

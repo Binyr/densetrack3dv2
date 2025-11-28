@@ -38,7 +38,7 @@ class DINOv3_Encoder(torch.nn.Module):
         for param in self.model.parameters():
             param.requires_grad = False
 
-    @torch.no_grad()
+    # @torch.no_grad()
     def encoder(self, x, size=None):
         '''
         x: [b h w c], range from (-1, 1), rbg
