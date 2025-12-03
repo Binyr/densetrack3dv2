@@ -119,10 +119,16 @@ def track_loss(
     for i in range(I):
         i_weight = weight_offset ** (I - i - 1)
 
-        if use_huber_loss:
-            i_loss = huber_loss(prediction[:, i], gt, delta=delta_huber_loss)
+        # binyanrui
+        if len(gt.shape) == 5: # this means gt is B I T N C
+            gt_ = gt[:, i]
         else:
-            i_loss = (prediction[:, i] - gt).abs()  # S, N, 2
+            gt_ = gt
+        # binyanrui
+        if use_huber_loss:
+            i_loss = huber_loss(prediction[:, i], gt_, delta=delta_huber_loss)
+        else:
+            i_loss = (prediction[:, i] - gt_).abs()  # S, N, 2
 
         i_loss = torch.mean(i_loss, dim=-1)  # S, N
 

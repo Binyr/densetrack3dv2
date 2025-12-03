@@ -1,6 +1,8 @@
 # torchrun --nnodes=1 --nproc_per_node=1 --master_port=23432 scripts/train/train_acc_3d.py --config-name densetrack3dv2
 # torchrun --nnodes=2 --nproc_per_node=8 --master_port=23432 scripts/train/train_acc_3d.py --config-name densetrack3dv2
-
+defaults:
+  - data:
+data: [] 
 
 model_name: "densetrack3dv2"
 restore_ckpt: "../DELTA_densetrack3d/checkpoints/densetrack3d.pth"
@@ -27,6 +29,12 @@ radius_supp: 3
 stride_supp: 1
 
 cycle_loss: False
+cycle_loss_vis_th: 0.8
+lambda_cycle: 0.1
+use_pstudio: False
+use_dr: False
+dataset_repeats: "1"
+
 
 batch_size: 1
 num_nodes: 1
@@ -105,6 +113,7 @@ lambda_d: 1.0
 lambda_vis: 0.1
 lambda_conf: 0.1
 lambda_rigid_loss: null
+
 
 hydra:
   verbose: True

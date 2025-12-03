@@ -116,6 +116,8 @@ class DynamicReplicaDataset(data.Dataset):
         image_size = (H, W)
 
         for i in range(T):
+            import pdb
+            pdb.set_trace()
             traj_path = os.path.join(self.root, self.split, sample[i].trajectories["path"])
             traj = torch.load(traj_path)
 
@@ -156,4 +158,4 @@ class DynamicReplicaDataset(data.Dataset):
             visibility=visibility,
             valid=torch.ones(T, N),
             seq_name=sample[0].sequence_name,
-        )
+        ), True

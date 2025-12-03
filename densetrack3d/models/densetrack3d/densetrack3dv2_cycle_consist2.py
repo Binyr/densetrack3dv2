@@ -746,9 +746,16 @@ class DenseTrack3DV2(nn.Module):
             dcorrs = self.get_single_corr_depth(depthmaps, coords, coord_depths)
 
         # use queried feature instead
-        # _h = fmaps_pyramid[-1].shape[3]
-        # if _h == 192:
-        # track_feat_cur = sample_features5d(fmaps_pyramid[-1], )
+        _h = fmaps_pyramid[-1].shape[3]
+        if _h == 192:
+            sample_coords = coords * 2.
+        elif _h == 96:
+            sample_coords = coords
+        elif _h == 48:
+            sample_coords = coords / 2.
+        else:
+            raise
+        track_feat_cur = sample_features5d(fmaps_pyramid[-1], sample_coords)
 
         # Get the 2D flow embeddings
         flows_2d = coords - coords[:, 0:1]
@@ -787,6 +794,13 @@ class DenseTrack3DV2(nn.Module):
                 ],
                 dim=-1,
             )
+        transformer_input = torch.cat(
+            [
+                transformer_input,
+                track_feat_cur
+            ]
+        )
+
 
         pos_emb = sample_features4d(self.pos_emb.repeat(B, 1, 1, 1), coords[:, 0])
         

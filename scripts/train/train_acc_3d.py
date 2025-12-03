@@ -13,6 +13,8 @@ import numpy as np
 import torch
 from densetrack3d.datasets.cvo_dataset import CVO
 from densetrack3d.datasets.kubric_dataset import KubricDataset
+from densetrack3d.datasets.dr_dataset2 import DynamicReplicaDataset
+from densetrack3d.datasets.mix_dataset import MixDataset
 from densetrack3d.datasets.tapvid2d_dataset import TapVid2DDataset
 from densetrack3d.datasets.utils import collate_fn, collate_fn_train, dataclass_to_cuda_
 from densetrack3d.evaluation.core.evaluator import Evaluator
@@ -20,7 +22,7 @@ from densetrack3d.evaluation.core.evaluator import Evaluator
 from densetrack3d.models.densetrack3d.densetrack3d import DenseTrack3D
 # from densetrack3d.models.densetrack3d.densetrack3dv2 import DenseTrack3DV2
 from densetrack3d.models.densetrack3d.densetrack3dv2_cycle_consist import DenseTrack3DV2
-
+from densetrack3d.datasets.tapvid3d_dataset2 import TapVid3DDataset
 
 from densetrack3d.models.evaluation_predictor.evaluation_predictor import EvaluationPredictor
 from densetrack3d.models.loss import balanced_bce_loss, seq_balanced_bce_loss, bce_loss, seq_bce_loss, confidence_loss, seq_confidence_loss, track_loss, rigid_instane_loss
@@ -148,76 +150,12 @@ def sample_sparse_queries(trajs_g, trajs_d, vis_g):
     return sparse_queries
 
 
-def forward_batch(batch, model, args, accelerator=None):
-    model_stride = args.model_stride
-
-    video = batch.video
-    videodepth = batch.videodepth
-    depth_init = batch.depth_init
-    depth_init_last = batch.depth_init_last
-
-    max_depth = videodepth[videodepth > 0.01].max()
-
-    trajs_g = batch.trajectory
-    trajs_d = batch.trajectory_d
-    vis_g = batch.visibility
-    valids = batch.valid
-
-    dense_trajectory_d = batch.dense_trajectory_d
-
-    flow = batch.flow
-    flow_alpha = batch.flow_alpha
-
-    # breakpoint()
-    B, T, C, H, W = video.shape
-    assert C == 3
-    # B, T, N, D = trajs_g.shape
-    device = video.device
-
-    sparse_queries = sample_sparse_queries(trajs_g, trajs_d, vis_g)
-    n_sparse_queries = sparse_queries.shape[1]
-    #############################
-    # n_input_queries = 256
-    # NOTE add regular grid queries:
-    def get_grid_queries(depth_init):
-        grid_xy = get_points_on_a_grid((12, 16), video.shape[3:]).long().float()
-        grid_xy = torch.cat([torch.zeros_like(grid_xy[:, :, :1]), grid_xy], dim=2).to(device)  # B, N, C
-        grid_xy_d = bilinear_sampler(depth_init, rearrange(grid_xy[..., 1:3], "b n c -> b () n c"), mode="nearest")
-        grid_xy_d = rearrange(grid_xy_d, "b c m n -> b (m n) c")
-        grid_queries = torch.cat([grid_xy, grid_xy_d], dim=-1)
-        return grid_queries
-
-    grid_queries = get_grid_queries(depth_init)
-    grid_queries_last = get_grid_queries(depth_init_last)
-    
-    # input_queries = torch.cat([sparse_queries, grid_queries], dim=1)
-    input_queries = sparse_queries
-    # with torch.amp.autocast(device_type=device.type, enabled=True):
-    sparse_predictions, dense_predictions, (sparse_train_data_dict, dense_train_data_dict), _, _, _ = model(
-        video=video,
-        videodepth=videodepth,
-        sparse_queries=input_queries,
-        depth_init=depth_init,
-        iters=args.train_iters,
-        is_train=True,
-        use_dense=args.use_dense,
-        accelerator=accelerator,
-        grid_queries=grid_queries,
-        grid_queries_last=grid_queries_last,
-        depth_init_last=depth_init_last,
-    )
-
+def calc_sparse_loss(args, sparse_train_data_dict, batch, trajs_g, trajs_d, vis_g, valids, n_sparse_queries, W, H, max_depth, use_sparse=True):
     coord_predictions = sparse_train_data_dict["coords"]
     coord_depth_predictions = sparse_train_data_dict["coord_depths"]
     vis_predictions = sparse_train_data_dict["vis"]
     conf_predictions = sparse_train_data_dict["conf"]
     valid_mask = sparse_train_data_dict["mask"]
-    if args.use_dense:
-        dense_coord_predictions = dense_train_data_dict["coords"]
-        dense_coord_depth_predictions = dense_train_data_dict["coord_depths"]
-        dense_vis_predictions = dense_train_data_dict["vis"]
-        dense_conf_predictions = dense_train_data_dict["conf"]
-        (x0, y0) = dense_train_data_dict["x0y0"]
 
     S = args.sliding_window_len
 
@@ -226,7 +164,9 @@ def forward_batch(batch, model, args, accelerator=None):
     vis_loss = torch.tensor(0.0, requires_grad=True).cuda()
     conf_loss = torch.tensor(0.0, requires_grad=True).cuda()
     rigid_loss = torch.tensor(0.0, requires_grad=True).cuda()
-
+    if not use_sparse:
+        return seq_loss, seq_depth_loss, vis_loss, conf_loss, rigid_loss
+    
     for idx, ind in enumerate(range(0, args.sequence_len - S // 2, S // 2)):
 
         traj_gt_ = trajs_g[:, ind : ind + S].clone()
@@ -284,13 +224,167 @@ def forward_batch(batch, model, args, accelerator=None):
     if args.lambda_rigid_loss is not None:
         rigid_loss = rigid_loss * args.lambda_rigid_loss / len(coord_predictions)
 
+    return seq_loss, seq_depth_loss, vis_loss, conf_loss, rigid_loss
+
+def calc_cycle_loss(args, sparse_train_data_dict, sparse_train_data_dict_inverse,
+                    vis_g, n_sparse_queries, W, H, max_depth):
+    coord_predictions = sparse_train_data_dict["coords"]
+    coord_depth_predictions = sparse_train_data_dict["coord_depths"]
+    valid_mask = sparse_train_data_dict["mask"]
+    # avoid calc vis and conf loss. Inaccurate uv may lead to incorrect vis and conf, now vis and conf loss becomes meaningless.
+    # vis_predictions = sparse_train_data_dict["vis"]
+    # conf_predictions = sparse_train_data_dict["conf"]
+
+    coord_predictions_inverse = sparse_train_data_dict_inverse["coords"]
+    coord_depth_predictions_inverse = sparse_train_data_dict_inverse["coord_depths"]
+    valid_mask_inverse = sparse_train_data_dict_inverse["mask"]
+
+    valid_mask_from_vis = vis_g[:, -1, :] == 1 # B, N
+    valid_mask_from_vis = valid_mask_from_vis.unsqueeze(1).repeat(1, args.sequence_len, 1)
+    valid_mask_inverse[:, :, :n_sparse_queries] *= valid_mask_from_vis
+    
+    S = args.sliding_window_len
+
+    seq_loss = torch.tensor(0.0, requires_grad=True).cuda()
+    seq_depth_loss = torch.tensor(0.0, requires_grad=True).cuda()
+
+    for idx, ind in enumerate(range(0, args.sequence_len - S // 2, S // 2)):
+
+        
+        valid_gt_ = valid_mask[:, ind : ind + S, :n_sparse_queries].clone() * valid_mask_inverse[:, ind : ind + S, :n_sparse_queries].clone() # this means track before query will not calc the loss
+        # 1. 
+        coord_predictions_ = coord_predictions[idx][:, :, :, :n_sparse_queries, :].clone() # B I T N C
+        coord_depth_predictions_ = coord_depth_predictions[idx][:, :, :, :n_sparse_queries, :]
+
+        coord_predictions_[..., 0] /= W - 1
+        coord_predictions_[..., 1] /= H - 1
+
+        coord_depth_predictions_[coord_depth_predictions_ < 0.01] = 0.01
+        coord_depth_predictions_ /= max_depth
+
+        # 2. inverse
+        coord_predictions_inverse_ = coord_predictions_inverse[idx][:, :, :, :n_sparse_queries, :].clone() # B I T N C
+        coord_depth_predictions_inverse_ = coord_depth_predictions_inverse[idx][:, :, :, :n_sparse_queries, :]
+
+        coord_predictions_inverse_[..., 0] /= W - 1
+        coord_predictions_inverse_[..., 1] /= H - 1
+
+        coord_depth_predictions_inverse_[coord_depth_predictions_inverse_ < 0.01] = 0.01
+        coord_depth_predictions_inverse_ /= max_depth
+
+        # 3. calc loss
+        seq_loss += track_loss(coord_predictions_, coord_predictions_inverse_, valid_gt_, divide_n_repeat=False, use_huber_loss=False, delta_huber_loss=6.0/W)
+        # seq_depth_loss += track_loss(1 / coord_depth_predictions_, 1 / coord_depth_predictions_inverse_, valid_gt_, divide_n_repeat=False)
+        
+    seq_loss = seq_loss * args.lambda_2d * args.lambda_cycle / len(coord_predictions)
+    seq_depth_loss = seq_depth_loss * args.lambda_d * args.lambda_cycle / len(coord_predictions)
+
+    return seq_loss, seq_depth_loss
+
+def forward_batch(batch, model, args, accelerator=None):
+    model_stride = args.model_stride
+
+    video = batch.video
+    videodepth = batch.videodepth
+    depth_init = batch.depth_init
+    depth_init_last = batch.depth_init_last
+
+    max_depth = videodepth[videodepth > 0.01].max()
+
+    trajs_g = batch.trajectory
+    trajs_d = batch.trajectory_d
+    vis_g = batch.visibility
+    valids = batch.valid
+
+    dense_trajectory_d = batch.dense_trajectory_d
+
+    flow = batch.flow
+    flow_alpha = batch.flow_alpha
+
+    # breakpoint()
+    B, T, C, H, W = video.shape
+    assert C == 3
+    # B, T, N, D = trajs_g.shape
+    device = video.device
+    # if batch.dataset_name[0] == "pstudio":
+    #     import pdb
+    #     pdb.set_trace()
+    # print(batch.dataset_name[0], trajs_g.shape, trajs_d.shape, vis_g.shape)
+    sparse_queries = sample_sparse_queries(trajs_g, trajs_d, vis_g)
+    n_sparse_queries = sparse_queries.shape[1]
+    # print(batch.dataset_name[0], n_sparse_queries)
+    #############################
+    # n_input_queries = 256
+    # NOTE add regular grid queries:
+    def get_grid_queries(depth_init):
+        grid_xy = get_points_on_a_grid((12, 16), video.shape[3:]).long().float()
+        grid_xy = torch.cat([torch.zeros_like(grid_xy[:, :, :1]), grid_xy], dim=2).to(device)  # B, N, C
+        grid_xy_d = bilinear_sampler(depth_init, rearrange(grid_xy[..., 1:3], "b n c -> b () n c"), mode="nearest")
+        grid_xy_d = rearrange(grid_xy_d, "b c m n -> b (m n) c")
+        grid_queries = torch.cat([grid_xy, grid_xy_d], dim=-1)
+        return grid_queries
+
+    grid_queries = get_grid_queries(depth_init)
+    grid_queries_last = get_grid_queries(depth_init_last)
+    
+    # input_queries = torch.cat([sparse_queries, grid_queries], dim=1)
+    input_queries = sparse_queries
+    # with torch.amp.autocast(device_type=device.type, enabled=True):
+    use_dense = args.use_dense
+    use_cycle_loss = args.cycle_loss
+    use_sparse = True
+
+    if batch.dataset_name[0] == "dynamic_replica":
+        use_dense = False
+    
+    if batch.dataset_name[0] == "pstudio":
+        use_dense = False
+        use_sparse = False
+        use_cycle_loss = True
+
+    sparse_predictions, dense_predictions, (sparse_train_data_dict, dense_train_data_dict), \
+        sparse_predictions_inverse, dense_predictions_inverse, (sparse_train_data_dict_inverse, dense_train_data_dict_inverse) = model(
+        video=video,
+        videodepth=videodepth,
+        sparse_queries=input_queries,
+        depth_init=depth_init,
+        iters=args.train_iters,
+        is_train=True,
+        use_dense=use_dense,
+        accelerator=accelerator,
+        grid_queries=grid_queries,
+        grid_queries_last=grid_queries_last,
+        depth_init_last=depth_init_last,
+        cycle_loss=use_cycle_loss
+    )
+
+    # sparse loss
+    seq_loss, seq_depth_loss, vis_loss, conf_loss, rigid_loss = calc_sparse_loss(args, sparse_train_data_dict, batch, trajs_g, trajs_d, vis_g, valids, n_sparse_queries, W, H, max_depth, use_sparse=use_sparse)
+    # cycle loss
+    seq_loss_cycle = torch.tensor(0.0, requires_grad=True).cuda()
+    seq_depth_loss_cycle = torch.tensor(0.0, requires_grad=True).cuda()
+    if use_cycle_loss:
+        vis_p = sparse_predictions["vis"][..., :n_sparse_queries].clone().detach() > args.cycle_loss_vis_th
+        # import pdb
+        # pdb.set_trace()
+        seq_loss_cycle, seq_depth_loss_cycle = calc_cycle_loss(
+            args, sparse_train_data_dict, sparse_train_data_dict_inverse,
+            vis_p, n_sparse_queries, W, H, max_depth)
+    
+    # dense loss
     dense_seq_loss = torch.tensor(0.0, requires_grad=True).cuda()
     dense_seq_depth_loss = torch.tensor(0.0, requires_grad=True).cuda()
     dense_vis_loss = torch.tensor(0.0, requires_grad=True).cuda()
     dense_conf_loss = torch.tensor(0.0, requires_grad=True).cuda()
     dense_rigid_loss = torch.tensor(0.0, requires_grad=True).cuda()
+    if use_dense:
+        S = args.sliding_window_len
 
-    if args.use_dense:
+        dense_coord_predictions = dense_train_data_dict["coords"]
+        dense_coord_depth_predictions = dense_train_data_dict["coord_depths"]
+        dense_vis_predictions = dense_train_data_dict["vis"]
+        dense_conf_predictions = dense_train_data_dict["conf"]
+        (x0, y0) = dense_train_data_dict["x0y0"]
         for idx, ind in enumerate(range(0, args.sequence_len - S // 2, S // 2)):
 
             if idx >= len(dense_coord_predictions):
@@ -300,7 +394,6 @@ def forward_batch(batch, model, args, accelerator=None):
             dense_coord_depth_prediction_ = dense_coord_depth_predictions[idx][0]  # I T, 3, H, W
             dense_vis_prediction_ = dense_vis_predictions[idx][0]  # I, T,  H, W
             dense_conf_prediction_ = dense_conf_predictions[idx][0]  # I, T,  H, W
-
 
             if len(dense_vis_prediction_.shape) == 3: # T H W
                 dense_vis_prediction_ = dense_vis_prediction_.unsqueeze(0)
@@ -391,9 +484,9 @@ def forward_batch(batch, model, args, accelerator=None):
         dense_vis_loss = dense_vis_loss * args.lambda_vis / len(dense_coord_predictions)
         dense_conf_loss = dense_conf_loss * args.lambda_conf / len(dense_coord_predictions)
         if args.lambda_rigid_loss is not None:
-            dense_rigid_loss = dense_rigid_loss * args.lambda_rigid_loss / len(coord_predictions)
+            dense_rigid_loss = dense_rigid_loss * args.lambda_rigid_loss / len(dense_coord_predictions)
 
-
+    # print(batch.dataset_name, use_dense)
     output = {
         "track_uv": {
             "loss": seq_loss.mean(),
@@ -428,7 +521,13 @@ def forward_batch(batch, model, args, accelerator=None):
         },
         "dense_rigid_loss":{
             "loss": dense_rigid_loss
-        }
+        },
+        "seq_loss_cycle":{
+            "loss": seq_loss_cycle
+        },
+        "seq_depth_loss_cycle":{
+            "loss": seq_depth_loss_cycle
+        },
     }
 
     return output
@@ -508,6 +607,56 @@ def save_model(save_path, accelerator, model, optimizer=None, scheduler=None, to
     logging.info(f"Saving file {save_path}")
     torch.save(save_dict, save_path)
 
+def get_multi_dataset(args):
+    kubric_dataset = KubricDataset(
+        data_root=KUBRIC3D_MIX_DIR,
+        
+        seq_len=args.sequence_len,
+        traj_per_sample=args.traj_per_sample,
+        sample_vis_1st_frame=True,
+        use_augs=not args.dont_use_augs,
+        use_gt_depth=True,
+        # read_from_s3=True,
+        read_from_s3=False
+    )
+    if (not args.use_dr) and (not args.use_pstudio):
+        return kubric_dataset
+
+    dataset_lis = [kubric_dataset]
+    if args.use_dr:
+        dr_dataset = DynamicReplicaDataset(
+            root="/mnt/shared-storage-user/dongjunting-group/DATA/dynamicreplica",
+            crop_size=(384, 512),
+            split="train",
+            traj_per_sample=args.traj_per_sample,
+            sample_len=args.sequence_len,
+            only_first_n_samples=-1,
+            rgbd_input=False,
+        )
+        dataset_lis.append(dr_dataset)
+    
+    if args.use_pstudio:
+        pstudio_dataset = TapVid3DDataset(
+            data_root="datasets/",
+            datatype="pstudio",
+            use_metric_depth=True,  # FIXME check here
+            split="mini",
+            read_from_s3=False,
+            seq_len=args.sequence_len,
+            traj_per_sample=args.traj_per_sample,
+            # depth_type="zoedepth"
+        )
+        dataset_lis.append(pstudio_dataset)
+    if isinstance(args.dataset_repeats, str):
+        repeats = eval(args.dataset_repeats)
+    else:
+        repeats = args.dataset_repeats
+    train_dataset = MixDataset(
+        dataset_lis,
+        repeats=repeats,
+    )
+    return train_dataset
+
 def train(args):
 
     accelerator = Accelerator(
@@ -534,17 +683,29 @@ def train(args):
     print(f"Trainable model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
     model.to(device)
 
-    train_dataset = KubricDataset(
-        data_root=KUBRIC3D_MIX_DIR,
-        crop_size=(384, 512),
-        seq_len=args.sequence_len,
-        traj_per_sample=args.traj_per_sample,
-        sample_vis_1st_frame=True,
-        use_augs=not args.dont_use_augs,
-        use_gt_depth=True,
-        # read_from_s3=True,
-        read_from_s3=False
-    )
+    if False and not args.use_dr:
+        train_dataset = KubricDataset(
+            data_root=KUBRIC3D_MIX_DIR,
+            crop_size=(384, 512),
+            seq_len=args.sequence_len,
+            traj_per_sample=args.traj_per_sample,
+            sample_vis_1st_frame=True,
+            use_augs=not args.dont_use_augs,
+            use_gt_depth=True,
+            # read_from_s3=True,
+            read_from_s3=False
+        )
+    else:
+        train_dataset = get_multi_dataset(args)
+        # train_dataset = DynamicReplicaDataset(
+        #     root="/mnt/shared-storage-user/dongjunting-group/DATA/dynamicreplica",
+        #     crop_size=(384, 512),
+        #     split="train",
+        #     traj_per_sample=args.traj_per_sample,
+        #     sample_len=args.sequence_len,
+        #     only_first_n_samples=-1,
+        #     rgbd_input=False,
+        # )
 
 
     train_loader = DataLoader(
@@ -829,6 +990,18 @@ def train(args):
             if (epoch + 1) % args.save_every_n_epoch == 0:
                 ckpt_iter = "0" * (6 - len(str(total_steps))) + str(total_steps)
                 save_path = Path(f"{args.ckpt_path}/model_{args.model_name}_{ckpt_iter}.pth")
+
+                save_model(
+                    save_path,
+                    accelerator,
+                    model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    total_steps=total_steps,
+                )
+            
+            if (total_steps + 1) % 1000 == 0:
+                save_path = Path(f"{args.ckpt_path}/model_{args.model_name}_latest.pth")
 
                 save_model(
                     save_path,
