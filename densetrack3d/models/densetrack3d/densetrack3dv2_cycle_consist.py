@@ -78,7 +78,8 @@ class DenseTrack3DV2(nn.Module):
         stride_supp="1",
         radius_corr="3",
         stride_corr="1",
-        cycle_loss=False
+        cycle_loss=False,
+        point_semantic="",
     ):
         super().__init__()
         self.window_len = window_len
@@ -197,6 +198,14 @@ class DenseTrack3DV2(nn.Module):
                 self.latent_dim += dino_c_dim
         else:
             self.input_dim = 1032
+        
+        self.point_semantic = point_semantic
+        if self.point_semantic:
+            self.input_dim += 128
+            if self.point_semantic == "dino":
+                in_c = self.dino_net.C
+                self.point_semantic_net = torch.nn.Linear(in_c, 128, bias=False)
+
 
         ###############
         # define dino #
@@ -745,10 +754,31 @@ class DenseTrack3DV2(nn.Module):
         with torch.no_grad():
             dcorrs = self.get_single_corr_depth(depthmaps, coords, coord_depths)
 
-        # use queried feature instead
-        # _h = fmaps_pyramid[-1].shape[3]
-        # if _h == 192:
-        # track_feat_cur = sample_features5d(fmaps_pyramid[-1], )
+        track_feat_cur = None
+        if self.point_semantic:
+            # use queried feature instead
+            _h = fmaps_pyramid[-1].shape[3]
+            if _h == 192:
+                sample_coords = coords * 2.
+            elif _h == 96:
+                sample_coords = coords
+            elif _h == 48:
+                sample_coords = coords / 2.
+            else:
+                raise
+            # sample_tgt_feat = bilinear_sampler(
+            #     fmaps_pyramid[lvl].reshape(B * S, -1, H_, W_),
+            #     coords_lvl.reshape(B * S, N, diameter * diameter, 2),
+            #     padding_mode="border",
+            # )
+            b, s = fmaps_pyramid[-1].shape[:2]
+            feats_reshape = rearrange(fmaps_pyramid[-1], "b s c h w -> (b s) c h w")
+            sample_coords = rearrange(sample_coords, "b s n c -> (b s) n 1 c")
+            track_feat_cur = bilinear_sampler(feats_reshape, sample_coords)
+            track_feat_cur = rearrange(track_feat_cur, "(b s) c n 1 -> b s n c", b=b, s=s)
+            if self.point_semantic == "dino":
+                track_feat_cur = self.point_semantic_net(track_feat_cur)
+        
 
         # Get the 2D flow embeddings
         flows_2d = coords - coords[:, 0:1]
@@ -758,8 +788,7 @@ class DenseTrack3DV2(nn.Module):
         
         # for x in ["flows_2d_emb", "flows_2d", "flows_3d", "fcorrs", "dcorrs", "track_feat", "track_mask_vis"]:
         #     print(f"{x}", eval(x).shape)
-        # import pdb
-        # pdb.set_trace()
+        
         if fcorrs.shape[-1] > 768:
             transformer_input = torch.cat(
                 [
@@ -787,6 +816,15 @@ class DenseTrack3DV2(nn.Module):
                 ],
                 dim=-1,
             )
+        if self.point_semantic:   
+            transformer_input = torch.cat(
+                [
+                    transformer_input,
+                    track_feat_cur
+                ],
+                dim=-1
+            )
+
 
         pos_emb = sample_features4d(self.pos_emb.repeat(B, 1, 1, 1), coords[:, 0])
         
