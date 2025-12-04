@@ -35,7 +35,7 @@ use_pstudio: False
 use_dr: False
 dataset_repeats: "1"
 use_po: False
-
+point_semantic: ""
 
 batch_size: 1
 num_nodes: 1
@@ -68,7 +68,7 @@ eval_datasets:
 
 num_virtual_tracks: 64
 dont_use_augs: false
-sample_vis_1st_frame: false
+sample_vis_1st_frame: ""
 
 sliding_window_len: 16
 model_stride: 4
@@ -103,7 +103,8 @@ model: DenseTrack3DV2(
     stride_corr="${stride_corr}",
     radius_supp="${radius_supp}",
     stride_supp="${stride_supp}",
-    cycle_loss=${cycle_loss}
+    cycle_loss=${cycle_loss},
+    point_semantic="${point_semantic}",
   )
 
 accum_iter: 1
