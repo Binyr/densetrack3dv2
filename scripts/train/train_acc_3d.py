@@ -14,6 +14,7 @@ import torch
 from densetrack3d.datasets.cvo_dataset import CVO
 from densetrack3d.datasets.kubric_dataset import KubricDataset
 from densetrack3d.datasets.dr_dataset2 import DynamicReplicaDataset
+from densetrack3d.datasets.point_odyssey_official import PointOdysseyDataset
 from densetrack3d.datasets.mix_dataset import MixDataset
 from densetrack3d.datasets.tapvid2d_dataset import TapVid2DDataset
 from densetrack3d.datasets.utils import collate_fn, collate_fn_train, dataclass_to_cuda_
@@ -342,6 +343,9 @@ def forward_batch(batch, model, args, accelerator=None):
         use_sparse = False
         use_cycle_loss = True
 
+    if batch.dataset_name[0] == "PO":
+        use_dense = False
+
     sparse_predictions, dense_predictions, (sparse_train_data_dict, dense_train_data_dict), \
         sparse_predictions_inverse, dense_predictions_inverse, (sparse_train_data_dict_inverse, dense_train_data_dict_inverse) = model(
         video=video,
@@ -619,7 +623,7 @@ def get_multi_dataset(args):
         # read_from_s3=True,
         read_from_s3=False
     )
-    if (not args.use_dr) and (not args.use_pstudio):
+    if (not args.use_dr) and (not args.use_pstudio) and (not args.use_po):
         return kubric_dataset
 
     dataset_lis = [kubric_dataset]
@@ -647,6 +651,19 @@ def get_multi_dataset(args):
             # depth_type="zoedepth"
         )
         dataset_lis.append(pstudio_dataset)
+    if args.use_po:
+        po_dataset = PointOdysseyDataset(
+            dataset_location="datasets/point0dyssey/",
+            dset="train",
+            use_augs=False,
+            S=args.sequence_len,
+            N=args.traj_per_sample,
+            crop_size=(384, 512),
+            resize_size=(384+64, 512+64),
+            strides=[2],
+        )
+        dataset_lis.append(po_dataset)
+
     if isinstance(args.dataset_repeats, str):
         repeats = eval(args.dataset_repeats)
     else:

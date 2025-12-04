@@ -12,7 +12,6 @@ class MixDataset(torch.utils.data.Dataset):
         
         # global idx
         global_idxes = [x for x in range(num_objects)]
-
         # local dataset and its idx
         pairs = []
         for did, dataset in enumerate(dataset_list):

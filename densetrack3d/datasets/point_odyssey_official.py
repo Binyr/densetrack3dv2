@@ -18,6 +18,19 @@ from functools import partial
 import sys
 from densetrack3d.datasets.utils import DeltaData, add_noise_depth, aug_depth
 
+from densetrack3d.utils.utils import depth_to_distance_numpy
+
+_DEFAULT_EXCLUDE_SCENES = {
+    "character", "character0", "character0_", "character0_f", "character0_f2",
+    "character1", "character1_f",
+    "character2", "character2_", "character2_f",
+    "character3", "character3_f",
+    "character4", "character4_", "character4_f",
+    "character5", "character5_", "character5_f",
+    "character6", "character6_f",
+    "gso_in_big", "gso_out_big",
+}
+
 def augment_video(augmenter, **kwargs):
     assert isinstance(augmenter, A.ReplayCompose)
     keys = kwargs.keys()
@@ -78,7 +91,11 @@ class PointOdysseyDataset(torch.utils.data.Dataset):
             for seq in glob.glob(os.path.join(subdir, "*")):
                 if os.path.isdir(seq):
                     seq_name = seq.split('/')[-1]
+                    if seq_name in _DEFAULT_EXCLUDE_SCENES:
+                        continue
                     self.sequences.append(seq)
+                    
+
 
         self.sequences = sorted(self.sequences)
         if self.verbose:
@@ -160,6 +177,7 @@ class PointOdysseyDataset(torch.utils.data.Dataset):
             A.ImageCompression(quality_lower=50, quality_upper=100, p=0.3),
         ], p=0.8)
         
+        print(f"total {self.__len__()} samples in PO")
 
     def getitem_helper(self, index):
         sample = None
@@ -239,6 +257,9 @@ class PointOdysseyDataset(torch.utils.data.Dataset):
             depth = depth16.astype(np.float32) / 65535.0 * 1000.0
             depths.append(depth)
         
+        depths = np.stack(depths, 0)[:, None]
+        depths = [x[0] for x in depth_to_distance_numpy(depths, pix_T_cams)]
+
         masks = []
         for mask_path in mask_paths:
             with Image.open(mask_path) as im:
@@ -327,15 +348,15 @@ class PointOdysseyDataset(torch.utils.data.Dataset):
                 trajs = np.flip(trajs, axis=0)
                 visibs = np.flip(visibs, axis=0)
 
+        
         if self.use_augs and (np.random.rand() < self.spatial_aug_prob):
             rgbs, masks, edges, trajs = self.add_spatial_augs(rgbs, masks, edges, trajs, visibs)
         else:
             # either crop or resize
             if np.random.rand() < 0.5:
-                rgbs, masks, edges, trajs, depths = self.just_crop(rgbs, masks, edges, trajs, depths)
+                rgbs, masks, edges, trajs, depths, pix_T_cams = self.just_crop(rgbs, masks, edges, trajs, depths, pix_T_cams)
             else:
-                rgbs, masks, edges, trajs, depths = self.just_resize(rgbs, masks, edges, trajs, depths)
-
+                rgbs, masks, edges, trajs, depths, pix_T_cams = self.just_resize(rgbs, masks, edges, trajs, depths, pix_T_cams)
         H,W,C = rgbs[0].shape
         assert(C==3)
         
@@ -447,6 +468,8 @@ class PointOdysseyDataset(torch.utils.data.Dataset):
         visibs = torch.from_numpy(visibs_full).float() # S,N
         valids = torch.from_numpy(valids_full).float() # S,N
         trajs_d = torch.from_numpy(trajs_d_full).float() # S,N,1
+        intrinsics = torch.from_numpy(np.stack(pix_T_cams, 0)).float() # S,3,3
+        cam2worlds = torch.from_numpy(np.stack(cams_T_world, 0)).float() # S,3,3
         sample = {
             'rgbs': rgbs,
             'masks': masks,
@@ -457,7 +480,10 @@ class PointOdysseyDataset(torch.utils.data.Dataset):
             "trajs_d": trajs_d,
             "depths": depths,
             "seq_name": self.sequences_name[index],
-            "dataset_name": "PO"
+            "dataset_name": "PO",
+            "intrinsics": intrinsics,
+            "cam2worlds": cam2worlds
+
         }
         samle_delta = from_sample_to_DeltaData(sample)
         return samle_delta, True
@@ -638,7 +664,7 @@ class PointOdysseyDataset(torch.utils.data.Dataset):
             
         return rgbs, masks, edges, trajs
 
-    def just_crop(self, rgbs, masks, edges, trajs, depths):
+    def just_crop(self, rgbs, masks, edges, trajs, depths, pix_T_cams):
         T, N, _ = trajs.shape
         
         S = len(rgbs)
@@ -656,9 +682,21 @@ class PointOdysseyDataset(torch.utils.data.Dataset):
         trajs[:,:,0] -= x0
         trajs[:,:,1] -= y0
 
-        return rgbs, masks, edges, trajs, depths
+        def adjust_intrinsics_for_crop(K, x0, y0):
+            """
+            K: (3,3) intrinsic before crop
+            x0, y0: top-left coordinates of crop in original image
+            """
+            K_new = K.copy()
+            K_new[0, 2] = K[0, 2] - x0   # cx'
+            K_new[1, 2] = K[1, 2] - y0   # cy'
+            return K_new
 
-    def just_resize(self, rgbs, masks, edges, trajs, depths):
+        pix_T_cams = [adjust_intrinsics_for_crop(x, x0, y0) for x in pix_T_cams]
+
+        return rgbs, masks, edges, trajs, depths, pix_T_cams
+
+    def just_resize(self, rgbs, masks, edges, trajs, depths, pix_T_cams):
         T, N, _ = trajs.shape
         
         S = len(rgbs)
@@ -675,8 +713,21 @@ class PointOdysseyDataset(torch.utils.data.Dataset):
         edges = [cv2.resize(edge, (W_new, H_new), interpolation=cv2.INTER_NEAREST) for edge in edges]
         sc_py = np.array([sx_, sy_]).reshape([1,1,2])
         trajs = trajs * sc_py
+
+        def adjust_intrinsics_for_resize(K, sx, sy):
+            # sx = new_w / orig_w
+            # sy = new_h / orig_h
+            
+            K_new = K.copy()
+            K_new[0, 0] = K[0, 0] * sx     # fx'
+            K_new[1, 1] = K[1, 1] * sy     # fy'
+            K_new[0, 2] = K[0, 2] * sx     # cx'
+            K_new[1, 2] = K[1, 2] * sy     # cy'
+            return K_new
         
-        return rgbs, masks, edges, trajs, depths
+        pix_T_cams = [adjust_intrinsics_for_resize(x, sx_, sy_) for x in pix_T_cams]
+        
+        return rgbs, masks, edges, trajs, depths, pix_T_cams
 
     def __len__(self):
         return len(self.rgb_paths)
@@ -691,7 +742,9 @@ def from_sample_to_DeltaData(sample):
             'visibs': visibs,
             'valids': valids,
             "trajs_d": trajs_d,
-            "depths": depths
+            "depths": depths,
+            "intrinsics": intrinsics,
+            "cam2worlds": cam2worlds
         }
     """
     depths = sample["depths"].float()
@@ -725,7 +778,8 @@ def from_sample_to_DeltaData(sample):
             dataset_name=sample["dataset_name"],
             depth_min=depths.min(),
             depth_max=depths.max(),
-            # intrs=intrinsic_mat,
+            intrs=sample["intrinsics"],
+            cam2worlds=sample["cam2worlds"],
             # dense_queries_inst_id=dense_queries_inst_id,
             # sparse_queries_inst_id=sparse_queries_inst_id,
             depth_init_last=depth_init_last

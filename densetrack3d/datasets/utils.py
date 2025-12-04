@@ -73,6 +73,7 @@ class DeltaData:
     sparse_queries_inst_id: Optional[torch.Tensor] = None
 
     depth_init_last: torch.Tensor = None
+    cam2worlds: torch.Tensor = None
     
 
 def collate_fn(batch):
