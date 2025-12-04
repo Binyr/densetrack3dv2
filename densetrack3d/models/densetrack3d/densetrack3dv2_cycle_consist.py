@@ -1434,7 +1434,7 @@ class DenseTrack3DV2(nn.Module):
                 higher_fmaps.flip(1),
                 fmaps.flip(1),
                 lower_fmaps.flip(1),
-                dino_fmaps.flip(1),
+                dino_fmaps.flip(1) if dino_fmaps is not None else None,
             )
             # import pdb
             # pdb.set_trace()

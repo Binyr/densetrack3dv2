@@ -714,6 +714,20 @@ class Evaluator:
             if is_vis:
                 trajs_g = sample.trajectory # B,T,N,2
                 trajs_e = traj_e
+                
+                to_save = {
+                    "trajs_e_uvd": traj_uvd.cpu().numpy(),
+                    "trajs_e_3d": traj_3d.cpu().numpy(),
+                    "trajs_g_uv": sample.trajectory.cpu().numpy(),
+                    "trajs_g_3d": sample.trajectory3d.cpu().numpy(),
+                    "intrinsics": sample.intrs.cpu().numpy()
+                }
+                
+                from pathlib import Path
+                npz_path = Path(self.exp_dir) / "npz" / f"{sample.seq_name[0]}"
+                npz_path.parent.mkdir(exist_ok=True, parents=True)
+                np.savez(str(npz_path), **to_save)
+
                 if False:
                     value, index_ = torch.linalg.norm(trajs_g - trajs_e, dim=3).mean(dim=1).sort(dim=1)
                     for iii in range(1, 11):
@@ -732,23 +746,22 @@ class Evaluator:
                         )
                     raise
                 else:
-                    value, index_ = torch.linalg.norm(trajs_g - trajs_e, dim=3).mean(dim=1).sort(dim=1)
-                    index = index_[:, -10:]
-                    print(index)
-                    trajs_g_ = trajs_g[:, :, index[0]]
-                    trajs_e_ = trajs_e[:, :, index[0]]
-                    queries_ = queries[:, index[0]]
-                    print(torch.linalg.norm(trajs_g - trajs_e, dim=3)[:, :, index[0]].squeeze().cpu().numpy().round(3))
-                    print(queries_.squeeze())
-                    vis.visualize(
-                        video=sample.video,
-                        tracks=trajs_e_,
-                        gt_tracks=trajs_g_,
-                        filename=f"{sample.seq_name[0]}",
-                        queries=queries_,
-                    )
-
-        
+                    pass
+                    # value, index_ = torch.linalg.norm(trajs_g - trajs_e, dim=3).mean(dim=1).sort(dim=1)
+                    # index = index_[:, -10:]
+                    # print(index)
+                    # trajs_g_ = trajs_g[:, :, index[0]]
+                    # trajs_e_ = trajs_e[:, :, index[0]]
+                    # queries_ = queries[:, index[0]]
+                    # print(torch.linalg.norm(trajs_g - trajs_e, dim=3)[:, :, index[0]].squeeze().cpu().numpy().round(3))
+                    # print(queries_.squeeze())
+                    # vis.visualize(
+                    #     video=sample.video,
+                    #     tracks=trajs_e_,
+                    #     gt_tracks=trajs_g_,
+                    #     filename=f"{sample.seq_name[0]}",
+                    #     queries=queries_,
+                    # )
         return metrics
 
     @torch.no_grad()
