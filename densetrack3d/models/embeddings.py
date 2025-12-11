@@ -149,9 +149,9 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim: int, pos: torch.Tensor) -> torc
     if embed_dim == 1032 or embed_dim == 1032 // 2:
         emb = torch.cat([emb_sin, emb_cos], dim=1)  # (M, D)
     else:
-        if embed_dim == 1288:
+        if embed_dim == 1288 or embed_dim == (1288 + 128):
             h = 1032 // 2
-        elif embed_dim == 1288 // 2:
+        elif embed_dim == 1288 // 2 or embed_dim == (1288 + 128) // 2:
             h = 1032 // 2 // 2
         else:
             raise
