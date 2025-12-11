@@ -501,7 +501,7 @@ class PointOdysseyDataset(torch.utils.data.Dataset):
         #     }
         while not gotit:
             sample, gotit = self.getitem_helper(index)
-            index += 1
+            index =  (index + 1) % len(self)
         return sample, gotit
 
     def add_spatial_augs(self, rgbs, masks, edges, trajs, visibs):
