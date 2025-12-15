@@ -1374,6 +1374,7 @@ class DenseTrack3DV2(nn.Module):
         grid_queries_last = None,
         depth_init_last = None,
         cycle_loss  = False,
+        ret_feats = False,
     ) -> tuple[dict | None, dict | None, tuple[dict | None, dict | None] | None]:
         """Predict tracks
 
@@ -1428,7 +1429,8 @@ class DenseTrack3DV2(nn.Module):
             fmaps, higher_fmaps, lower_fmaps, dino_fmaps = self.extract_features(video)
         
         n_sparse = sparse_queries.shape[1]
-        sparse_queries = torch.cat([sparse_queries, grid_queries], dim=1)
+        if grid_queries is not None:
+            sparse_queries = torch.cat([sparse_queries, grid_queries], dim=1)
         sparse_predictions, dense_predictions, train_data = self.forward_tracking_head(
             video,
             videodepth,
@@ -1504,7 +1506,10 @@ class DenseTrack3DV2(nn.Module):
                     
             return sparse_predictions, dense_predictions, train_data, sparse_predictions_inverse, dense_predictions_inverse, train_data_inverse
         else:
-            return sparse_predictions, dense_predictions, train_data, None, None, (None, None)
+            if ret_feats:
+                return sparse_predictions, dense_predictions, train_data, None, None, (None, None), (fmaps, higher_fmaps, lower_fmaps, dino_fmaps)
+            else:
+                return sparse_predictions, dense_predictions, train_data, None, None, (None, None)
     
     def forward_tracking_head(
         self,
@@ -1523,12 +1528,12 @@ class DenseTrack3DV2(nn.Module):
         lower_fmaps = None,
         dino_fmaps = None,
     ) -> tuple[dict | None, dict | None, tuple[dict | None, dict | None] | None]:
-        B, T, C, H, W = video.shape
+        B, _, C, H, W = video.shape
         S = self.window_len
         device = video.device
         step = S // 2
         use_sparse = self.use_sparse
-        ori_T = self.ori_T
+        T = ori_T = self.ori_T
         Dz = self.Dz
 
         # print(dino_fmaps.shape)
@@ -1749,7 +1754,6 @@ class DenseTrack3DV2(nn.Module):
                     use_efficient_global_attn=use_efficient_global_attn,
                     inter_up_mask_dict=inter_up_mask_dict,
                 )
-
             S_trimmed = min(T - ind, S)  # accounts for last window duration
 
             if use_sparse:

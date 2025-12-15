@@ -408,6 +408,14 @@ class Visualizer:
                 res_video[t] = self._draw_gt_tracks(res_video[t], gt_tracks[t : t + 1],
                                                     vector_colors=vector_colors,
                                                     is_query_frames=is_query_frames)
+        # binyanrui: draw gt queries and acceptance field    
+        if queries is not None:
+            res_video = self._draw_acceptance_field(
+                res_video,
+                queries, # (B, N, C)
+                tracks, # (T, 2)
+                vector_colors[0],
+            )
 
         #  construct the final rgb sequence
         if self.show_first_frame > 0:
@@ -500,3 +508,73 @@ class Visualizer:
     
         rgb = np.array(rgb)
         return rgb
+
+    def _draw_acceptance_field(self, res_videos, queries, tracks, colors):
+        # tracks: T, I, 2
+        
+        B, N, C = queries.shape
+        assert N == 1, "we just visualize one traj"
+
+        query_t = int(queries[0, 0, 0].item())
+        # now we need to re-organize the video
+        video_bw = res_videos[:query_t+1][::-1] # from query to first frame
+        video_fw = res_videos[query_t:]
+
+        tracks_bw = tracks[:query_t+1, -1][::-1] # T,6,2 -> T',2
+        tracks_fw = tracks[query_t:, -1] # T,6,2 -> T'',2
+
+        # ok now let's begin to draw
+        from collections import defaultdict
+        res_video = defaultdict(list)
+        for i, video in enumerate([video_bw, video_fw]):
+            T = len(video)
+            S = 32 # window length
+            step = S // 2
+            num_windows = (T - S + step - 1) // step + 1
+            # We process only the current video chunk in the online mode
+            indices = range(0, step * num_windows, step)
+            if len(indices) == 0:
+                indices = [0]
+            
+            rx = 17*2
+            ry = 13*2
+            for ind in indices:
+                if ind > 0: # in the non-first window, the init cords are ...
+                    if i == 0:
+                        init_cords = tracks_bw[ind+step]
+                    else:
+                        init_cords = tracks_fw[ind+step]
+                    
+                    u, v = init_cords[0:2]
+                    coord_y = (int(u) + rx, int(v) + ry)
+                    coord_x = (int(u) - rx, int(v) - ry)
+                    for j in range(ind + S // 2, min(ind + S, T)):
+                        rgb = Image.fromarray(video[j])
+                        rgb = draw_rectangle(
+                            rgb,
+                            xy=[coord_x, coord_y],
+                            color=tuple(colors[0].astype(int).tolist()),
+                            linewidth=self.linewidth
+                        )
+                        res_video[i].append(rgb)
+                    
+                else: # in the first window, the init cords are query
+                    # init_cords = tracks_bw[0]
+                    u, v = queries[0, 0, 1:3]
+                    coord_y = (int(u) + rx, int(v) + ry)
+                    coord_x = (int(u) - rx, int(v) - ry)
+                    for j in range(S):
+                        rgb = Image.fromarray(video[j])
+                        rgb = draw_rectangle(
+                            rgb,
+                            xy=[coord_x, coord_y],
+                            color=tuple(colors[0].astype(int).tolist()),
+                            linewidth=self.linewidth
+                        )
+                        res_video[i].append(rgb)
+
+        res_video_bw = res_video[0]
+        res_video_fw = res_video[1]
+
+        res_video = res_video_bw[::-1] + res_video_fw
+        return res_video

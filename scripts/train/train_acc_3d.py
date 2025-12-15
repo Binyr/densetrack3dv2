@@ -15,6 +15,7 @@ from densetrack3d.datasets.cvo_dataset import CVO
 from densetrack3d.datasets.kubric_dataset import KubricDataset
 from densetrack3d.datasets.dr_dataset2 import DynamicReplicaDataset
 from densetrack3d.datasets.point_odyssey_official import PointOdysseyDataset
+from densetrack3d.datasets.stereo4d_video_depth import SimpleVideoDepthDataset
 from densetrack3d.datasets.mix_dataset import MixDataset
 from densetrack3d.datasets.tapvid2d_dataset import TapVid2DDataset
 from densetrack3d.datasets.utils import collate_fn, collate_fn_train, dataclass_to_cuda_
@@ -114,7 +115,148 @@ def vis_instance_mask(batch):
     Image.fromarray(vis).save("vis_inst_id.png")
 
 
-    
+import torch
+
+def sample_random_queries_from_video(video: torch.Tensor,
+                                     num_queries: int):
+    """
+    Randomly sample sparse queries on a video, similar in spirit to sample_sparse_queries
+    but without trajs_g / trajs_d / vis_g.
+
+    Args:
+        video: Tensor of shape [T, 3, H, W] or [B, T, 3, H, W], values in any range.
+        num_queries: int, number of query points per video in the batch.
+        return_rgb: if True, also return RGB at each query.
+
+    Returns:
+        queries: [B, num_queries, 3] float tensor:
+                 (t_idx, x, y) in **pixel coordinates** (t is integer index cast to float).
+        rgb_at_queries (optional): [B, num_queries, 3] float tensor with RGB values
+                                   at each query (same dtype as video).
+
+    Notes:
+        - If video is [T, 3, H, W], this function treats it as batch size B=1.
+        - t_idx is an integer in [0, T-1], x in [0, W-1], y in [0, H-1].
+        - You can normalize x,y later if needed (e.g., to [-1,1] for grid_sample).
+    """
+    if video.dim() == 4:
+        # add batch dimension
+        video = video.unsqueeze(0)  # [1, T, 3, H, W]
+
+    assert video.dim() == 5, "video must be [T,3,H,W] or [B,T,3,H,W]"
+    B, T, C, H, W = video.shape
+    device = video.device
+
+    # Random integer indices for time and space
+    t_idx = torch.randint(low=0, high=T, size=(B, num_queries), device=device)  # [B, N]
+    y_idx = torch.randint(low=0, high=H, size=(B, num_queries), device=device)  # [B, N]
+    x_idx = torch.randint(low=0, high=W, size=(B, num_queries), device=device)  # [B, N]
+
+    # Stack as (t, x, y); keep as float for consistency with your old code
+    queries = torch.stack([t_idx.float(), x_idx.float(), y_idx.float()], dim=-1)  # [B, N, 3]
+
+    return queries
+
+import torch
+
+
+def sample_queries_excluding_far_depth(video: torch.Tensor,
+                                       video_depth: torch.Tensor,
+                                       num_queries: int,
+                                       return_rgb: bool = False,
+                                       keep_percent: float = 0.7):
+    """
+    Sample queries from a video, but EXCLUDE pixels with top (1 - keep_percent) depth.
+
+    Args:
+        video:       [T, 3, H, W] or [B, T, 3, H, W]
+        video_depth: [T, 1, H, W] or [B, T, 1, H, W], depth in meters
+        num_queries: number of queries per video
+        return_rgb:  if True, also return RGB values at sampled pixels
+        keep_percent: keep nearest keep_percent of valid depth pixels
+                      (e.g. 0.7 → drop farthest 30%)
+
+    Returns:
+        queries: [B, num_queries, 4]
+                 (t_idx, x, y, depth_m)
+        rgb_at_queries (optional): [B, num_queries, 3]
+    """
+    # ---- normalize shapes to [B, T, ..., H, W] ----
+    if video.dim() == 4:
+        video = video.unsqueeze(0)        # [1, T, 3, H, W]
+    if video_depth.dim() == 4:
+        video_depth = video_depth.unsqueeze(0)  # [1, T, 1, H, W]
+
+    assert video.dim() == 5 and video_depth.dim() == 5
+    B, T, C, H, W = video.shape
+    assert video_depth.shape[0] == B and video_depth.shape[1] == T
+    assert video_depth.shape[2] == 1 and video_depth.shape[3] == H and video_depth.shape[4] == W
+
+    device = video.device
+
+    # [B, T, H, W] depth in meters
+    depth = video_depth[:, :, 0]  # strip channel
+    depth_flat = depth.reshape(B, -1)  # [B, N], N = T*H*W
+
+    # finite & >0 as "valid"
+    valid_mask = torch.isfinite(depth_flat) & (depth_flat > 0)
+
+    # ---- compute per-video depth thresholds (70th percentile by default) ----
+    thresholds = torch.zeros(B, device=device)
+    for b in range(B):
+        valid_depths = depth_flat[b][valid_mask[b]]
+        if valid_depths.numel() == 0:
+            thresholds[b] = float("inf")  # no valid depth → don't exclude anything
+        else:
+            thresholds[b] = torch.quantile(valid_depths, keep_percent)
+
+    # ---- keep only pixels with depth <= threshold (i.e., drop farthest 30%) ----
+    thresholds_expanded = thresholds[:, None]  # [B, 1]
+    candidate_mask = valid_mask & (depth_flat <= thresholds_expanded)  # [B, N]
+
+    # if some video ends up with no candidates (degenerate), fall back to valid_mask
+    row_sum = candidate_mask.sum(dim=1, keepdim=True)  # [B, 1]
+    zero_row = row_sum <= 0
+    if zero_row.any():
+        candidate_mask[zero_row.expand_as(candidate_mask)] = valid_mask[zero_row.expand_as(valid_mask)]
+
+    # ---- build uniform probs over candidate pixels ----
+    weights = candidate_mask.float()
+    row_sum = weights.sum(dim=1, keepdim=True)
+    probs = weights / (row_sum + 1e-8)  # [B, N]
+
+    num_pixels = depth_flat.shape[1]
+    replacement = num_queries > num_pixels
+
+    # sample flattened indices
+    flat_idx = torch.multinomial(probs, num_samples=num_queries, replacement=replacement)  # [B, Nq]
+
+    # ---- convert flat indices -> (t, y, x) ----
+    Nq = num_queries
+    HW = H * W
+    t_idx = flat_idx // HW          # [B, Nq]
+    hw_idx = flat_idx % HW          # [B, Nq]
+    y_idx = hw_idx // W             # [B, Nq]
+    x_idx = hw_idx % W              # [B, Nq]
+
+    # ---- gather depth at query locations ----
+    b_idx = torch.arange(B, device=device)[:, None].expand(B, Nq)  # [B, Nq]
+    depth_at = depth[b_idx, t_idx, y_idx, x_idx]  # [B, Nq]
+
+    # queries = (frame_idx, x, y, depth)
+    queries = torch.stack(
+        [t_idx.float(), x_idx.float(), y_idx.float(), depth_at.float()],
+        dim=-1
+    )  # [B, Nq, 4]
+
+    if not return_rgb:
+        return queries
+
+    # ---- gather RGB at query locations ----
+    rgb_at = video[b_idx, t_idx, :, y_idx, x_idx]  # [B, Nq, 3]
+
+    return queries, rgb_at
+ 
 
 def sample_sparse_queries(trajs_g, trajs_d, vis_g):
     B, T, N, D = trajs_g.shape
@@ -307,11 +449,10 @@ def forward_batch(batch, model, args, accelerator=None):
     assert C == 3
     # B, T, N, D = trajs_g.shape
     device = video.device
-    # if batch.dataset_name[0] == "pstudio":
-    #     import pdb
-    #     pdb.set_trace()
-    # print(batch.dataset_name[0], trajs_g.shape, trajs_d.shape, vis_g.shape)
-    sparse_queries = sample_sparse_queries(trajs_g, trajs_d, vis_g)
+    if batch.dataset_name[0] == "stereo4d":
+        sparse_queries = sample_queries_excluding_far_depth(video, videodepth, num_queries=args.traj_per_sample)
+    else:
+        sparse_queries = sample_sparse_queries(trajs_g, trajs_d, vis_g)
     n_sparse_queries = sparse_queries.shape[1]
     # print(batch.dataset_name[0], n_sparse_queries)
     #############################
@@ -338,7 +479,7 @@ def forward_batch(batch, model, args, accelerator=None):
     if batch.dataset_name[0] == "dynamic_replica":
         use_dense = False
     
-    if batch.dataset_name[0] == "pstudio":
+    if batch.dataset_name[0] in ["stereo4d", "pstudio"]:
         use_dense = False
         use_sparse = False
         use_cycle_loss = True
@@ -623,8 +764,8 @@ def get_multi_dataset(args):
         # read_from_s3=True,
         read_from_s3=False
     )
-    if (not args.use_dr) and (not args.use_pstudio) and (not args.use_po):
-        return kubric_dataset
+    # if (not args.use_dr) and (not args.use_pstudio) and (not args.use_po) and (not args.use):
+    #     return kubric_dataset
 
     dataset_lis = [kubric_dataset]
     if args.use_dr:
@@ -651,6 +792,7 @@ def get_multi_dataset(args):
             # depth_type="zoedepth"
         )
         dataset_lis.append(pstudio_dataset)
+
     if args.use_po:
         po_dataset = PointOdysseyDataset(
             dataset_location="datasets/point0dyssey/",
@@ -663,6 +805,19 @@ def get_multi_dataset(args):
             strides=[2],
         )
         dataset_lis.append(po_dataset)
+    
+    if args.use_stereo4d:
+        st_dataset = SimpleVideoDepthDataset(
+            data_root="datasets/stereo4d/huggingface/",
+            ann_path="datasets/stereo4d/huggingface/frame_counts.json",
+            split="train",
+            seq_len=args.sequence_len,
+            resize_short_edge=512,
+        )
+        dataset_lis.append(st_dataset)
+    
+    if len(dataset_lis) == 1:
+        return dataset_lis[0]
 
     if isinstance(args.dataset_repeats, str):
         repeats = eval(args.dataset_repeats)

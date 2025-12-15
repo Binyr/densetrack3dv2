@@ -36,6 +36,7 @@ use_dr: False
 dataset_repeats: "1"
 use_po: False
 point_semantic: ""
+use_stereo4d: false
 
 batch_size: 1
 num_nodes: 1

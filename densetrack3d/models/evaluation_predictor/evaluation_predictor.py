@@ -509,7 +509,7 @@ class EvaluationPredictor(torch.nn.Module):
                 traj_d_e.append(traj_d_)
             traj_d_e = torch.stack(traj_d_e, dim=1)  # B T N 1
         else:
-            sparse_predictions, dense_predictions, _ = self.model(
+            sparse_predictions, dense_predictions, _ , _, _, _ = self.model(
                 video=video,
                 videodepth=videodepth,
                 sparse_queries=queries,
